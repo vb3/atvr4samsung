@@ -1,0 +1,43 @@
+# Example systemd unit for running atvr4samsung on the Raspberry Pi.
+#
+# Install:
+#   sudo useradd --system --home /opt/atvr4samsung --shell /usr/sbin/nologin atvbridge || true
+#   sudo mkdir -p /opt/atvr4samsung /etc/atvr4samsung /var/lib/atvr4samsung
+#   # put the venv + code under /opt/atvr4samsung, config under /etc/atvr4samsung/config.yaml
+#   sudo chown -R atvbridge:atvbridge /opt/atvr4samsung /var/lib/atvr4samsung
+#   sudo cp systemd/atvr4samsung.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now atvr4samsung
+#
+# The state_dir in config.yaml should point at /var/lib/atvr4samsung (pairing keys + TV token).
+
+[Unit]
+Description=atvr4samsung (emulated Apple TV -> Samsung Frame TV)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atvbridge
+Group=atvbridge
+WorkingDirectory=/opt/atvr4samsung
+ExecStart=/opt/atvr4samsung/.venv/bin/atvr4samsung --config /etc/atvr4samsung/config.yaml
+Restart=on-failure
+RestartSec=3
+
+# mDNS + the Companion TCP listener need the LAN; everything else is locked down.
+StateDirectory=atvr4samsung
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/atvr4samsung
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

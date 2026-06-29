@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atvr4samsung"
+version = "0.1.0"
+description = "Emulate an Apple TV for the native iOS Control Center remote, and relay its commands to a Samsung Frame TV."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "vb3" }]
+keywords = ["appletv", "companion", "samsung", "frame-tv", "tizen", "remote", "homekit", "mdns"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+]
+
+# Runtime dependencies.
+# The Companion server is first-party (src/atvr4samsung/companion/protocol/), derived from pyatv
+# v0.18.0 (MIT). We depend on its few real third-party libs directly, not on pyatv:
+# cryptography + srptools (HAP/SRP pairing), chacha20poly1305-reuseable (session AEAD), zeroconf (mDNS).
+dependencies = [
+    "cryptography>=42",
+    "srptools>=1.0",
+    "chacha20poly1305-reuseable>=0.12",
+    "zeroconf>=0.130",
+    "samsungtvws[async]>=2.6.0",
+    "wakeonlan>=3.0.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+atvr4samsung = "atvr4samsung.app:main"
+
+[project.urls]
+Repository = "https://github.com/vb3/atvr4samsung"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atvr4samsung = ["config.example.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

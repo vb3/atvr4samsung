@@ -1,0 +1,39 @@
+# atvr4samsung — example configuration.
+# Copy this to `config.yaml` (gitignored) and edit. NEVER commit the real config.yaml,
+# the PIN, or the Samsung token file.
+
+companion:
+  # Name shown in the iPhone's Control Center remote picker.
+  device_name: "Frame Living Room"
+
+  # Static pairing PIN you enter once on the iPhone (honored by the bridge). Set your own — avoid
+  # weak/default values like 0000/1111/1234; the bridge logs a warning if the PIN looks weak.
+  pin: "1337"
+
+  # TCP port the Companion server listens on. 0 = ephemeral (mDNS advertises whatever was chosen).
+  # Pick a fixed port if your VLAN firewall needs a static allow rule for phone -> Pi.
+  port: 49152
+
+  # rpMd value advertised over mDNS (which Apple TV model we imitate). AppleTV14,1 = Apple TV 4K 3rd-gen; required for CC Power.
+  model: "AppleTV14,1"
+
+  # Where pairing keys / persisted server identity live. Keep OFF any shared/world dir.
+  state_dir: "~/.local/state/atvr4samsung"
+
+samsung:
+  host: "192.168.1.50"            # Frame TV IP
+  mac: "AA:BB:CC:DD:EE:FF"        # Frame TV wired MAC (for Wake-on-LAN)
+  port: 8002                      # 8002 = TLS + persistent token (use this for a daemon)
+  name: "atvr4samsung"        # remote name shown on the TV's Allow/Deny prompt
+  token_file: "~/.local/state/atvr4samsung/samsung-token.txt"
+
+  wol:
+    enabled: true
+    # Pi is on the SAME subnet as the TV -> directed broadcast works.
+    # If you ever move the Pi to another subnet, set this to the TV's IP for unicast WoL
+    # (requires the TV's "Fast Start / Instant On" = ON so the NIC keeps listening).
+    broadcast: "192.168.1.255"
+    port: 9
+
+logging:
+  level: "INFO"                   # DEBUG to see decoded Companion frames + Samsung wire traffic

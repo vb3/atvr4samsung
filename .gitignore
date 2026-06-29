@@ -1,0 +1,42 @@
+# ---- secrets / runtime state (NEVER commit) ----
+# The real config holds the Frame TV IP/MAC, the pairing PIN, and token paths. Keep it OUT of git.
+config.yaml
+config.yml
+config.*.yaml
+config.local.yaml
+*.local.yaml
+# ...but DO keep the committed template:
+!config.example.yaml
+
+# Pairing keys, Samsung tokens, and any persisted runtime state.
+*.token
+*-token.txt
+token_file
+samsung-token*
+secrets/
+state/
+*.ltpk
+*.key
+pairing/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- editor / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store

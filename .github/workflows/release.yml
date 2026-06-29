@@ -1,0 +1,125 @@
+name: Release
+
+# Publish a GitHub Release (built wheel + sdist) automatically when a push to main raises the
+# (major, minor) version — i.e. the version becomes X.Y.0. Routine patch (z) bumps are skipped.
+# The release decision lives in scripts/release_decision.py (pure + unit-tested).
+
+"on":
+  push:
+    branches: [main]
+    paths: ["pyproject.toml"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Decide whether to release
+        id: decide
+        env:
+          BEFORE: ${{ github.event.before }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          read_version() { python -c "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])"; }
+
+          CUR="$(read_version < pyproject.toml)"
+          echo "Current version: $CUR"
+
+          # Previous version = pyproject.toml at the commit before this push. The zero-SHA means a
+          # brand-new branch / first push (no parent), so there is no previous version → skip.
+          PREV=""
+          if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            PREV="$(git show "${BEFORE}:pyproject.toml" 2>/dev/null | read_version 2>/dev/null || true)"
+          fi
+          echo "Previous version: ${PREV:-<none>}"
+
+          DECISION="$(python scripts/release_decision.py "$PREV" "$CUR")"
+          TAG="v$CUR"
+
+          # Idempotency: never try to re-create an existing release/tag (e.g. on a re-run).
+          if [ "$DECISION" = "release" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — skipping."
+            DECISION="skip"
+          fi
+
+          echo "Decision: $DECISION (tag $TAG)"
+          {
+            echo "release=$([ "$DECISION" = "release" ] && echo true || echo false)"
+            echo "version=$CUR"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.detect.outputs.tag }}
+      VERSION: ${{ needs.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test gate
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          python -m pytest -q
+
+      - name: Build wheel + sdist
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+
+      - name: Verify built artifacts match the version
+        run: |
+          set -euo pipefail
+          ls -1 dist/
+          test -f "dist/atvr4samsung-${VERSION}-py3-none-any.whl"
+          test -f "dist/atvr4samsung-${VERSION}.tar.gz"
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          # Pull the "## [VERSION] ..." section body (up to the next "## [" header). Fall back to an
+          # empty file so the release step can use --generate-notes instead.
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > notes.md || true
+          # Trim leading/trailing blank lines.
+          sed -i -e '/./,$!d' notes.md
+          echo "---- notes.md ----"; cat notes.md || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -s notes.md ]; then
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+          fi
