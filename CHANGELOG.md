@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.5.0] - 2026-06-29
+
+### Security
+
+- Hardened the systemd unit written by `atvr4samsung install-service`. It previously emitted only
+  `NoNewPrivileges`/`ProtectSystem=full`/`LockPersonality` and fell back to `User=root` when `$USER`
+  was unset. It now: refuses to generate a unit that runs the LAN-facing service as **root** (resolves
+  the real operator via `SUDO_USER`/passwd), and adds home-compatible sandboxing — `PrivateTmp`,
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`, `RestrictNamespaces`, `RestrictSUIDSGID`,
+  and kernel module/tunable + control-group protection — without `ProtectHome`/`ProtectSystem=strict`
+  so the per-user `~/.config` + `~/.local/state` paths stay writable. Verified the generated unit
+  starts cleanly under the new restrictions on a real Raspberry Pi (`systemd-analyze security` exposure
+  dropped to MEDIUM). Found by a full-repository security review.
+
 ## [0.4.0] - 2026-06-29
 
 ### Security

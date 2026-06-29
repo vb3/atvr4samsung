@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack
+import getpass
 import logging
 import os
 import pathlib
@@ -215,7 +216,19 @@ def _cmd_init(path: str) -> int:
 def _cmd_install_service(config_path: str, apply: bool = False) -> int:
     exe = shutil.which("atvr4samsung") or f"{sys.executable} -m atvr4samsung.app"
     cfg = pathlib.Path(config_path).expanduser().resolve()
-    user = os.environ.get("USER", "root")
+    # Resolve the *real* operator even when invoked via sudo, and refuse to generate a unit that would
+    # run the LAN-facing service as root (a privilege-escalation footgun). SUDO_USER covers
+    # `sudo atvr4samsung ...`; getpass falls back to the passwd db when $USER is unset.
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or getpass.getuser()
+    if user == "root":
+        print("error: refusing to generate a service that runs as root. Re-run as your normal "
+              "user (the service only needs your home config/state and LAN access), or adapt the "
+              "hardened reference unit in systemd/atvr4samsung.service for a dedicated system user.")
+        return 1
+    # Hardening compatible with a per-user, home-based config/state install. We deliberately do NOT set
+    # ProtectHome / ProtectSystem=strict here because config (~/.config) and pairing state
+    # (~/.local/state) live under $HOME; the hardened system-wide alternative is
+    # systemd/atvr4samsung.service. AF_NETLINK is required for mDNS; AF_INET(6) for Companion + WoL.
     unit = f"""[Unit]
 Description=atvr4samsung (emulated Apple TV -> Samsung Frame TV)
 After=network-online.target
@@ -228,7 +241,14 @@ ExecStart={exe} --config {cfg}
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
+PrivateTmp=true
 ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictSUIDSGID=true
 LockPersonality=true
 
 [Install]

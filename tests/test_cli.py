@@ -110,6 +110,66 @@ class TestCmdUnpair(unittest.TestCase):
         self.assertEqual(_silently(app._cmd_unpair, cfg), 0)
 
 
+class TestInstallServiceUnit(unittest.TestCase):
+    """The generated systemd unit must be hardened and must never run the service as root."""
+
+    @contextlib.contextmanager
+    def _env(self, **overrides):
+        saved = {k: os.environ.get(k) for k in overrides}
+        try:
+            for k, v in overrides.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            yield
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def _generated_unit(self) -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = app._cmd_install_service("/tmp/atvr4samsung-test.yaml", apply=False)
+        self.assertEqual(rc, 0)
+        return buf.getvalue()
+
+    def test_refuses_to_run_as_root(self):
+        with self._env(SUDO_USER=None, USER="root"):
+            # getpass.getuser() can still return a non-root login name on the dev box; force root.
+            import getpass
+            orig = getpass.getuser
+            getpass.getuser = lambda: "root"
+            try:
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    rc = app._cmd_install_service("/tmp/atvr4samsung-test.yaml", apply=False)
+            finally:
+                getpass.getuser = orig
+        self.assertEqual(rc, 1)
+        self.assertIn("refusing", buf.getvalue().lower())
+
+    def test_prefers_sudo_user_over_root(self):
+        with self._env(SUDO_USER="alice", USER="root"):
+            unit = self._generated_unit()
+        self.assertIn("User=alice", unit)
+
+    def test_unit_is_hardened_and_home_compatible(self):
+        with self._env(SUDO_USER=None, USER="bob"):
+            unit = self._generated_unit()
+        for directive in (
+            "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=full",
+            "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK", "RestrictNamespaces=true",
+        ):
+            self.assertIn(directive, unit)
+        # Must NOT lock out the home dir — per-user config/state live under $HOME.
+        self.assertNotIn("ProtectHome", unit)
+        self.assertNotIn("ProtectSystem=strict", unit)
+
+
 class TestConfigPathExpansion(unittest.TestCase):
     """Regression: the default config path is `~/.config/...`; load_config must expand `~`."""
 

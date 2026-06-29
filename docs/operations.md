@@ -157,10 +157,14 @@ rm -rf ~/.config/atvr4samsung ~/.local/state/atvr4samsung   # also "Forget This 
 
 ## 7. systemd hardening
 
-`systemd/atvr4samsung.service` is a hardened reference unit (dedicated user, `ProtectSystem`,
-`RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`, `StateDirectory`, etc.). The bundled
-`atvr4samsung install-service` writes a simpler per-user unit; for a locked-down deployment adapt
-the reference unit and point `state_dir` at its `StateDirectory` (e.g. `/var/lib/atvr4samsung`).
+`systemd/atvr4samsung.service` is a hardened reference unit (dedicated system user, `ProtectSystem`,
+`ProtectHome`, `StateDirectory`, etc.) for a locked-down deployment. The bundled
+`atvr4samsung install-service` writes a per-user unit that runs as your own account (it refuses to
+generate a root unit) with home-compatible sandboxing — `NoNewPrivileges`, `PrivateTmp`,
+`ProtectSystem=full`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK`, `RestrictNamespaces`,
+kernel-tunable/module protection — while keeping `~/.config` + `~/.local/state` writable. For a
+dedicated-user deployment, adapt the reference unit and point `state_dir` at its `StateDirectory`
+(e.g. `/var/lib/atvr4samsung`).
 
 ## 8. Troubleshooting
 
