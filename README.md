@@ -100,6 +100,37 @@ enter your PIN. D-pad/Select/Menu/Home/Play-Pause + swipes drive the TV. Manage:
 
 `config.yaml`, the PIN, and the Samsung token file are **gitignored** — never commit them.
 
+## Pairing the Samsung TV (one-time "Allow" prompt)
+
+Pairing has **two independent sides**: the iPhone pairs with the bridge (PIN, above), and the **bridge
+pairs with the TV** (a one-time on-screen approval). The first time the bridge sends a command, the TV
+pops an **Allow / Deny** prompt naming the remote — by default **`atvr4samsung`** (this is the
+`samsung.name` value in your config). You must choose **Allow** on the TV with its physical remote.
+
+What happens, step by step:
+
+1. After install + pairing, press any button on the iPhone (e.g. **Volume**). Make sure the **TV is
+   on** — the bridge sends a Wake-on-LAN packet first, but the Allow prompt only shows once the TV is
+   awake.
+2. The TV displays *"Allow `atvr4samsung` to connect?"* (wording varies by model). Select **Allow**.
+3. The TV returns an access token, which the bridge saves to `samsung.token_file` (default
+   `~/.local/state/atvr4samsung/samsung-token.txt`). **All later connects are silent** — you won't be
+   asked again.
+
+Notes:
+
+- This works only on TV port **8002** (TLS + persistent token), which is the default. Port **8001**
+  re-prompts on *every* connect — don't use it for the always-on service.
+- If you miss the prompt, tap **Deny**, or delete the token file, the TV simply prompts again on the
+  next command — accept it and you're set.
+- The first command (or the first after the TV sleeps) can take a few seconds while the TV wakes and
+  the WebSocket connects; that's expected.
+- To revoke access, remove the granted device on the TV (Samsung **Settings → General → External
+  Device Manager → Device Connection Manager → Device List**, names vary by year) and delete
+  `samsung-token.txt`.
+
+Run `atvr4samsung doctor` to check the TV is reachable and the token path is writable before you start.
+
 ## Update
 
 Re-run the installer to reinstall the latest published Release wheel, then restart the service:

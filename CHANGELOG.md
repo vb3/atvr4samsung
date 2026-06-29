@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [Unreleased]
+
+### Documentation
+
+- README: added a "Pairing the Samsung TV (one-time Allow prompt)" section explaining that the bridge
+  must be approved on the TV the first time it sends a command — accept the on-screen Allow prompt
+  (named `atvr4samsung` by default), after which the token persists and later connects are silent.
+
 ## [0.3.0] - 2026-06-29
 
 ### Security
