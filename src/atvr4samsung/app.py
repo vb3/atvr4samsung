@@ -399,6 +399,8 @@ def main() -> int:
                         help="run (default), init config, print a systemd unit, doctor "
                              "(network preflight), or unpair (clear paired iPhones)")
     args = parser.parse_args()
+    # Expand ~ / $VARS once so every subcommand (and the default config path) resolves consistently.
+    args.config = os.path.expanduser(os.path.expandvars(args.config))
 
     if args.command == "init":
         return _cmd_init(args.config)

@@ -4,6 +4,7 @@ Stdlib-only and network-free — these cover our own decisions, not argparse or 
 """
 import contextlib
 import io
+import os
 import re
 import socket
 import tempfile
@@ -107,6 +108,34 @@ class TestCmdUnpair(unittest.TestCase):
     def test_no_state_dir_is_a_clean_noop(self):
         cfg = Config.from_mapping({"samsung": {"host": "1.2.3.4", "mac": "AA:BB:CC:DD:EE:FF"}})
         self.assertEqual(_silently(app._cmd_unpair, cfg), 0)
+
+
+class TestConfigPathExpansion(unittest.TestCase):
+    """Regression: the default config path is `~/.config/...`; load_config must expand `~`."""
+
+    def test_load_config_expands_tilde(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        from atvr4samsung.config import load_config
+
+        with tempfile.TemporaryDirectory() as home:
+            cfg_dir = Path(home) / ".config" / "atvr4samsung"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.yaml").write_text(
+                'samsung:\n  host: "10.0.0.5"\n  mac: "AA:BB:CC:DD:EE:FF"\n'
+            )
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = home
+            try:
+                cfg = load_config("~/.config/atvr4samsung/config.yaml")
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+            self.assertEqual(cfg.samsung.host, "10.0.0.5")
 
 
 if __name__ == "__main__":

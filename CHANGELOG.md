@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.2.0] - 2026-06-29
+
+### Fixed
+
+- Fresh-install fix: the default config path (`~/.config/atvr4samsung/config.yaml`) was passed through
+  literally, so `--check` / `doctor` / `run` failed with "Config not found" out of the box unless the
+  shell happened to expand `~`. `load_config` now expands `~`/`$VARS`, and the CLI expands `--config`
+  once for every subcommand. Caught by a fresh end-to-end install on a clean Raspberry Pi.
+
 ## [0.1.0] - 2026-06-29
 
 Initial public release. Emulates an Apple TV so the iPhone's native Control Center remote pairs over

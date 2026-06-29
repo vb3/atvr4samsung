@@ -149,7 +149,7 @@ class Config:
 def load_config(path: os.PathLike[str] | str) -> Config:
     import yaml  # lazy: keeps the dataclasses importable/testable without PyYAML installed
 
-    path = Path(path)
+    path = Path(path).expanduser()
     if not path.is_file():
         raise FileNotFoundError(
             f"Config not found: {path}. Copy config.example.yaml to config.yaml and edit it."
