@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
-## [Unreleased]
+## [0.4.0] - 2026-06-29
+
+### Security
+
+- **Pair-setup now verifies the controller (iPhone) signature (HAP M5).** Previously the bridge stored
+  a client's long-term public key from pair-setup M5 without checking the accompanying signature, so a
+  PIN-holding or malformed client could register a key without proving possession of the matching
+  private key. M5 is now validated end-to-end: it requires the identifier, public key, and signature,
+  a 32-byte Ed25519 key, and a valid signature over `iOSDeviceX || pairingID || LTPK`; any failure is
+  rejected with an Authentication error and **nothing is stored**. Verified live against a real iPhone
+  (iOS 26).
+- Pairing identifiers are now decoded as strict UTF-8 at both pair-setup and pair-verify; a non-UTF-8
+  identifier is rejected (fail closed) instead of being silently lossy-decoded.
 
 ### Documentation
 

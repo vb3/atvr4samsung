@@ -4,6 +4,7 @@ Regression coverage for the fail-open where an empty paired store accepted ANY c
 proof being read from the wrong message. These exercise our security decision directly, using the
 same crypto/TLV primitives the protocol uses (no iPhone, no network).
 """
+import binascii
 import os
 import unittest
 
@@ -11,9 +12,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from atvr4samsung.companion.protocol import chacha20
-from atvr4samsung.companion.protocol.auth import CompanionServerAuth
+from atvr4samsung.companion.protocol.auth import CompanionServerAuth, verify_controller_signature
 from atvr4samsung.companion.protocol.paired_clients import PairedClients
-from atvr4samsung.companion.protocol.tlv8 import TlvValue, write_tlv
+from atvr4samsung.companion.protocol.support import hkdf_expand
+from atvr4samsung.companion.protocol.tlv8 import ErrorCode, TlvValue, read_tlv, write_tlv
 
 
 class _Auth(CompanionServerAuth):
@@ -166,6 +168,166 @@ class TestPairVerifyMessages(unittest.TestCase):
         auth = _RecordingAuth("dev", paired_clients=PairedClients(None), require_paired=True)
         auth._m3_verify({TlvValue.EncryptedData: b"garbage"})
         self.assertEqual(auth.encryption_enabled, 0)
+
+
+class _FakeSRP:
+    """Stand-in for the SRP session so M5 tests skip the SRP handshake; only ``key`` is read."""
+
+    def __init__(self, key_hex):
+        self.key = key_hex
+
+
+class _SetupRecorder(CompanionServerAuth):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sent = []
+        self.paired_called = 0
+
+    def send_to_client(self, frame_type, data):
+        self.sent.append((frame_type, data))
+
+    def enable_encryption(self, output_key, input_key):
+        pass
+
+    def has_paired(self):
+        self.paired_called += 1
+
+
+def _controller_sign(client_sk, srp_key: bytes, identifier: bytes, ltpk: bytes) -> bytes:
+    ios_device_x = hkdf_expand(
+        "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info", srp_key
+    )
+    return client_sk.sign(ios_device_x + identifier + ltpk)
+
+
+def _m5_blob(srp_key: bytes, sub_tlv: dict) -> dict:
+    session_key = hkdf_expand("Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info", srp_key)
+    enc = chacha20.Chacha20Cipher(session_key, session_key).encrypt(
+        write_tlv(sub_tlv), nonce="PS-Msg05".encode()
+    )
+    return {TlvValue.EncryptedData: enc}
+
+
+class TestControllerSignatureHelper(unittest.TestCase):
+    def setUp(self):
+        self.srp_key = os.urandom(64)
+
+    def test_valid_signature_accepted(self):
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        sig = _controller_sign(sk, self.srp_key, b"X", ltpk)
+        self.assertTrue(verify_controller_signature(self.srp_key, b"X", ltpk, sig))
+
+    def test_tampered_signature_rejected(self):
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        sig = bytearray(_controller_sign(sk, self.srp_key, b"X", ltpk))
+        sig[0] ^= 0x01
+        self.assertFalse(verify_controller_signature(self.srp_key, b"X", ltpk, bytes(sig)))
+
+    def test_wrong_identifier_rejected(self):
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        sig = _controller_sign(sk, self.srp_key, b"X", ltpk)
+        self.assertFalse(verify_controller_signature(self.srp_key, b"Y", ltpk, sig))
+
+    def test_bad_ltpk_length_rejected(self):
+        self.assertFalse(verify_controller_signature(self.srp_key, b"X", b"\x00" * 16, b"\x00" * 64))
+
+
+class TestPairSetupM5(unittest.TestCase):
+    """M5 wire behavior: a valid controller signature stores + acks; anything else fails closed."""
+
+    def setUp(self):
+        self.srp_key = os.urandom(64)
+
+    def _auth(self):
+        auth = _SetupRecorder("dev", paired_clients=PairedClients(None), require_paired=True)
+        auth.session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        return auth
+
+    def _last_pd(self, auth):
+        return read_tlv(auth.sent[-1][1]["_pd"])
+
+    def _assert_rejected(self, auth):
+        self.assertTrue(auth._paired.empty())
+        self.assertEqual(auth.paired_called, 0)
+        self.assertEqual(self._last_pd(auth)[TlvValue.Error], bytes([ErrorCode.Authentication]))
+
+    def test_valid_m5_stores_and_acks(self):
+        auth = self._auth()
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        ident = b"CLIENT-A"
+        sig = _controller_sign(sk, self.srp_key, ident, ltpk)
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: ident, TlvValue.PublicKey: ltpk, TlvValue.Signature: sig,
+        }))
+        self.assertEqual(auth._paired.ltpk("CLIENT-A"), ltpk)
+        self.assertEqual(auth.paired_called, 1)
+        pd = self._last_pd(auth)
+        self.assertIn(TlvValue.EncryptedData, pd)  # M6 success is encrypted accessory info
+        self.assertNotIn(TlvValue.Error, pd)
+
+    def test_bad_signature_rejected(self):
+        auth = self._auth()
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        ident = b"CLIENT-A"
+        wrong_sig = _controller_sign(Ed25519PrivateKey.generate(), self.srp_key, ident, ltpk)
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: ident, TlvValue.PublicKey: ltpk, TlvValue.Signature: wrong_sig,
+        }))
+        self._assert_rejected(auth)
+
+    def test_missing_signature_rejected(self):
+        auth = self._auth()
+        sk = Ed25519PrivateKey.generate()
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: b"CLIENT-A", TlvValue.PublicKey: _ltpk(sk),
+        }))
+        self._assert_rejected(auth)
+
+    def test_non_utf8_identifier_rejected(self):
+        auth = self._auth()
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        ident = b"\xff\xfe-bad"
+        sig = _controller_sign(sk, self.srp_key, ident, ltpk)
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: ident, TlvValue.PublicKey: ltpk, TlvValue.Signature: sig,
+        }))
+        self._assert_rejected(auth)
+
+    def test_wrong_length_ltpk_rejected(self):
+        auth = self._auth()
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: b"CLIENT-A", TlvValue.PublicKey: b"\x00" * 16,
+            TlvValue.Signature: b"\x00" * 64,
+        }))
+        self._assert_rejected(auth)
+
+    def test_malformed_ciphertext_rejected(self):
+        auth = self._auth()
+        auth._m5_setup({TlvValue.EncryptedData: b"not-decryptable"})
+        self._assert_rejected(auth)
+
+    def test_valid_m5_then_pair_verify_succeeds(self):
+        auth = self._auth()
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        ident = b"CLIENT-A"
+        sig = _controller_sign(sk, self.srp_key, ident, ltpk)
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: ident, TlvValue.PublicKey: ltpk, TlvValue.Signature: sig,
+        }))
+        # Same client now passes pair-verify against the entry M5 stored.
+        client_pub, server_pub, session_key = os.urandom(32), os.urandom(32), os.urandom(32)
+        auth._pv_session_key, auth._pv_client_pub, auth._pv_server_pub = session_key, client_pub, server_pub
+        verify_sig = sk.sign(client_pub + ident + server_pub)
+        tlv = write_tlv({TlvValue.Identifier: ident, TlvValue.Signature: verify_sig})
+        enc = chacha20.Chacha20Cipher(session_key, session_key).encrypt(tlv, nonce="PV-Msg03".encode())
+        self.assertTrue(auth._verify_client({TlvValue.EncryptedData: enc}))
 
 
 if __name__ == "__main__":

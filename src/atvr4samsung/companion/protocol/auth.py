@@ -69,6 +69,24 @@ def new_server_session(keys, pin):
     return session, salt
 
 
+def verify_controller_signature(srp_session_key: bytes, identifier: bytes, ltpk: bytes, signature: bytes) -> bool:
+    """Verify the iOS controller's pair-setup M5 signature (HAP).
+
+    The controller signs ``iOSDeviceX || iOSDevicePairingID || iOSDeviceLTPK`` with its long-term
+    Ed25519 key, where ``iOSDeviceX`` is HKDF over the SRP shared secret with the controller-sign
+    salt/info (mirror of the accessory M6 construction). Returns False on any failure (bad signature,
+    wrong-length key, etc.) so callers fail closed.
+    """
+    try:
+        ios_device_x = hkdf_expand(
+            "Pair-Setup-Controller-Sign-Salt", "Pair-Setup-Controller-Sign-Info", srp_session_key
+        )
+        Ed25519PublicKey.from_public_bytes(ltpk).verify(signature, ios_device_x + identifier + ltpk)
+        return True
+    except Exception:
+        return False
+
+
 class CompanionServerAuth(ABC):
     def __init__(self, device_name, unique_id=SERVER_IDENTIFIER, pin=PIN_CODE, private_key=PRIVATE_KEY,
                  paired_clients=None, require_paired=False):
@@ -161,15 +179,16 @@ class CompanionServerAuth(ABC):
             chacha = chacha20.Chacha20Cipher(self._pv_session_key, self._pv_session_key)
             sub = read_tlv(chacha.decrypt(pairing_data[TlvValue.EncryptedData], nonce="PV-Msg03".encode()))
             identifier = sub[TlvValue.Identifier]  # raw bytes: iOS signs over these exact bytes
-            ltpk = self._paired.ltpk(identifier.decode(errors="replace"))
+            identifier_str = identifier.decode("utf-8")  # strict: non-UTF-8 raises -> fail closed below
+            ltpk = self._paired.ltpk(identifier_str)
             if ltpk is None:
-                _LOGGER.warning("Pair-verify from UNKNOWN client %s — rejecting", identifier.decode(errors="replace"))
+                _LOGGER.warning("Pair-verify from UNKNOWN client %s — rejecting", identifier_str)
                 return False
             # HAP construction: the controller signs clientEphemeralPK || pairingID || serverEphemeralPK.
             Ed25519PublicKey.from_public_bytes(ltpk).verify(
                 sub[TlvValue.Signature], self._pv_client_pub + identifier + self._pv_server_pub
             )
-            _LOGGER.info("Pair-verify OK for paired client %s", identifier.decode(errors="replace"))
+            _LOGGER.info("Pair-verify OK for paired client %s", identifier_str)
             return True
         except Exception:
             # Fail closed on ANY failure (bad signature, ChaCha InvalidTag, malformed TLV, or M3
@@ -223,25 +242,27 @@ class CompanionServerAuth(ABC):
             binascii.unhexlify(self.session.key),
         )
 
+        chacha = chacha20.Chacha20Cipher(session_key, session_key)
+        try:
+            client_tlv = read_tlv(
+                chacha.decrypt(pairing_data[TlvValue.EncryptedData], nonce="PS-Msg05".encode())
+            )
+        except Exception:
+            _LOGGER.warning("Pair-setup M5 could not be decrypted/parsed — rejecting")
+            self._send_setup_error()
+            return
+
+        _LOGGER.debug("Received pair-setup M5 encrypted payload")
+
+        if not self._register_setup_client(client_tlv):
+            self._send_setup_error()
+            return
+
         acc_device_x = hkdf_expand(
             "Pair-Setup-Accessory-Sign-Salt",
             "Pair-Setup-Accessory-Sign-Info",
             binascii.unhexlify(self.session.key),
         )
-
-        chacha = chacha20.Chacha20Cipher(session_key, session_key)
-        decrypted_tlv_bytes = chacha.decrypt(
-            pairing_data[TlvValue.EncryptedData], nonce="PS-Msg05".encode()
-        )
-
-        _LOGGER.debug("Received pair-setup M5 encrypted payload")
-
-        client_tlv = read_tlv(decrypted_tlv_bytes)
-        if self._paired and TlvValue.Identifier in client_tlv and TlvValue.PublicKey in client_tlv:
-            self._paired.add(
-                client_tlv[TlvValue.Identifier].decode(errors="replace"),
-                client_tlv[TlvValue.PublicKey],
-            )
 
         other = {
             "altIRK": b"-\x54\xe0\x7a\x88*en\x11\xab\x82v-'%\xc5",
@@ -271,6 +292,47 @@ class CompanionServerAuth(ABC):
 
         self.send_to_client(FrameType.PS_Next, {"_pd": tlv})
         self.has_paired()
+
+    def _register_setup_client(self, client_tlv) -> bool:
+        """Validate + record the controller's long-term key from M5. Fails closed.
+
+        Requires Identifier + PublicKey + Signature, a 32-byte Ed25519 LTPK, a UTF-8 identifier, and a
+        valid controller signature over ``iOSDeviceX || identifier || LTPK`` (proving the controller
+        holds the matching private key). Any failure returns False so the caller rejects the setup;
+        nothing is stored.
+        """
+        if self._paired is None:
+            return True  # ephemeral/no-store mode: nothing to persist or enforce
+
+        if not all(t in client_tlv for t in (TlvValue.Identifier, TlvValue.PublicKey, TlvValue.Signature)):
+            _LOGGER.warning("Pair-setup M5 missing identifier/public key/signature — rejecting")
+            return False
+
+        identifier = client_tlv[TlvValue.Identifier]
+        ltpk = client_tlv[TlvValue.PublicKey]
+        if len(ltpk) != 32:
+            _LOGGER.warning("Pair-setup M5 long-term key is %d bytes (need 32) — rejecting", len(ltpk))
+            return False
+        try:
+            identifier_str = identifier.decode("utf-8")  # strict: reject non-UTF-8 identifiers
+        except UnicodeDecodeError:
+            _LOGGER.warning("Pair-setup M5 identifier is not valid UTF-8 — rejecting")
+            return False
+
+        if not verify_controller_signature(
+            binascii.unhexlify(self.session.key), identifier, ltpk, client_tlv[TlvValue.Signature]
+        ):
+            _LOGGER.warning("Pair-setup M5 signature check FAILED for %s — rejecting", identifier_str)
+            return False
+
+        self._paired.add(identifier_str, ltpk)
+        return True
+
+    def _send_setup_error(self):
+        self.send_to_client(
+            FrameType.PS_Next,
+            {"_pd": write_tlv({TlvValue.SeqNo: b"\x06", TlvValue.Error: bytes([ErrorCode.Authentication])})},
+        )
 
     @abstractmethod
     def send_to_client(self, frame_type: FrameType, data: object) -> None:
