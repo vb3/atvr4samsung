@@ -6,7 +6,6 @@ from collections import namedtuple
 import hashlib
 import logging
 
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
@@ -97,12 +96,17 @@ class CompanionServerAuth(ABC):
         getattr(self, f"_m{seqno}_{suffix}")(pairing_data)
 
     def _m1_verify(self, pairing_data):
-        server_pub_key = self.keys.verify_pub.public_bytes(
+        # Fresh ephemeral X25519 per verify session (HAP requirement). A STATIC server ECDH key would
+        # make the session key a function of only the client's ephemeral input, so a replayed M1
+        # reproduces the same keys + nonce counters and lets recorded encrypted frames be replayed.
+        # Our long-term Ed25519 identity key (self.keys.sign) still signs M2 to prove who we are.
+        verify_private = X25519PrivateKey.generate()
+        server_pub_key = verify_private.public_key().public_bytes(
             encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
         client_pub_key = pairing_data[TlvValue.PublicKey]
 
-        shared_key = self.keys.verify.exchange(
+        shared_key = verify_private.exchange(
             X25519PublicKey.from_public_bytes(client_pub_key)
         )
 
@@ -133,34 +137,49 @@ class CompanionServerAuth(ABC):
 
         # Never log derived session keys; see SECURITY.md.
 
-        # Verify the client is one we PIN-paired: decrypt its proof, check its signature against the
-        # stored LTPK. Unknown/invalid clients are rejected (no encryption enabled).
-        self._verify_ok = self._verify_client(pairing_data, session_key, server_pub_key, client_pub_key)
+        # The client's proof (its pairing identifier + signature) arrives encrypted in M3, not here,
+        # so stash the verify-session material and do the paired-client check in _m3_verify. Verifying
+        # M1 (which only carries the client's ephemeral public key) can never see the proof.
+        self._pv_session_key = session_key
+        self._pv_server_pub = server_pub_key
+        self._pv_client_pub = client_pub_key
 
         self.send_to_client(FrameType.PV_Next, {"_pd": tlv})
 
-    def _verify_client(self, pairing_data, session_key, server_pub_key, client_pub_key) -> bool:
-        if not self._require_paired or self._paired.empty():
-            return True  # bootstrap: enforce only once at least one client is PIN-paired
+    def _verify_client(self, pairing_data) -> bool:
+        """Authorize an M3 pair-verify: the client must be PIN-paired with a valid signature.
+
+        Fails closed when ``require_paired`` is on: an empty store, an unknown client, or a bad
+        signature all reject (no encryption enabled). Pair-setup records the client's long-term key
+        before it ever runs verify, so a legitimate client is always present here; an empty store
+        means nobody PIN-paired (or it was cleared/lost) — precisely when a session must NOT be
+        granted. iOS responds to the rejection by falling back to PIN pair-setup.
+        """
+        if not self._require_paired:
+            return True  # no paired store configured -> enforcement disabled (legacy permissive)
         try:
-            chacha = chacha20.Chacha20Cipher(session_key, session_key)
+            chacha = chacha20.Chacha20Cipher(self._pv_session_key, self._pv_session_key)
             sub = read_tlv(chacha.decrypt(pairing_data[TlvValue.EncryptedData], nonce="PV-Msg03".encode()))
-            identifier = sub[TlvValue.Identifier].decode(errors="replace")
-            ltpk = self._paired.ltpk(identifier)
+            identifier = sub[TlvValue.Identifier]  # raw bytes: iOS signs over these exact bytes
+            ltpk = self._paired.ltpk(identifier.decode(errors="replace"))
             if ltpk is None:
-                _LOGGER.warning("Pair-verify from UNKNOWN client %s — rejecting", identifier)
+                _LOGGER.warning("Pair-verify from UNKNOWN client %s — rejecting", identifier.decode(errors="replace"))
                 return False
+            # HAP construction: the controller signs clientEphemeralPK || pairingID || serverEphemeralPK.
             Ed25519PublicKey.from_public_bytes(ltpk).verify(
-                sub[TlvValue.Signature], client_pub_key + identifier.encode() + server_pub_key
+                sub[TlvValue.Signature], self._pv_client_pub + identifier + self._pv_server_pub
             )
-            _LOGGER.info("Pair-verify OK for paired client %s", identifier)
+            _LOGGER.info("Pair-verify OK for paired client %s", identifier.decode(errors="replace"))
             return True
-        except (KeyError, InvalidSignature, ValueError):
-            _LOGGER.warning("Pair-verify signature check FAILED — rejecting client")
+        except Exception:
+            # Fail closed on ANY failure (bad signature, ChaCha InvalidTag, malformed TLV, or M3
+            # arriving without M1 so _pv_* is unset). Returning False makes _m3_verify send the
+            # standard auth rejection rather than letting the exception escape unanswered.
+            _LOGGER.warning("Pair-verify rejected (bad/unknown/malformed proof)")
             return False
 
     def _m3_verify(self, pairing_data):
-        if not getattr(self, "_verify_ok", True):
+        if not self._verify_client(pairing_data):
             self.send_to_client(
                 FrameType.PV_Next,
                 {"_pd": write_tlv({TlvValue.SeqNo: b"\x04", TlvValue.Error: bytes([ErrorCode.Authentication])})},

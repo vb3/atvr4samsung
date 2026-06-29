@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.3.0] - 2026-06-29
+
+### Security
+
+- **Pair-verify is now enforced (fail closed).** Two flaws let a non-PIN-paired client establish an
+  encrypted control session:
+  - An **empty paired-clients store** caused pair-verify to accept *any* client (no PIN). This is the
+    case on a fresh install before pairing, after `unpair`, or if `paired-clients.json` is lost — so
+    any device that could reach the Companion port could take control of the TV.
+  - The client's proof was checked against the **wrong pair-verify message** (M1 instead of M3), so
+    the signature check never actually ran for a returning client; enforcement only ever "passed" via
+    the empty-store path above.
+  Pair-verify now reads the client's encrypted identifier+signature from M3, verifies the signature
+  against the long-term key recorded at PIN pair-setup, and rejects an empty store, an unknown client,
+  or a bad signature (iOS then falls back to PIN pair-setup). Found by a live install + pairing test on
+  a Raspberry Pi with a real iPhone. Added unit tests for the accept and all reject paths.
+
 ## [0.2.0] - 2026-06-29
 
 ### Fixed

@@ -378,6 +378,8 @@ def _cmd_unpair(config: Config, *, reset_identity_too: bool = False) -> int:
 
     print("On the iPhone: open the Apple TV Remote, remove this remote (\"Forget This Remote\"), then "
           "pair again with your PIN. The Samsung token was left untouched.")
+    print("If the service is running, restart it for this to take effect: "
+          "sudo systemctl restart atvr4samsung")
     return 0
 
 
