@@ -132,19 +132,28 @@ class CompanionAdvertiser:
         self._current_ip: Optional[str] = None
         self._info: Optional[ServiceInfo] = None
         self._registered = False
+        self._closing = False
         self._task: Optional[asyncio.Future] = None
 
     def _build_info(self, address: str) -> ServiceInfo:
-        return ServiceInfo(
+        info = ServiceInfo(
             "_companion-link._tcp.local.",
             f"{self._device_name}._companion-link._tcp.local.",
             addresses=[IPv4Address(address).packed],
             port=self._port,
             properties=dict(self._properties),
         )
+        # zeroconf's register_service backfills the `server` (A-record host) but update_service does
+        # NOT — it asserts "ServiceInfo must have a server". Set it now (the same value register
+        # derives, the instance name) so a re-advertise on an IP change works, not just the first
+        # register. Without this, the first DHCP/interface IP change would fail to re-advertise.
+        info.set_server_if_missing()
+        return info
 
     async def refresh(self) -> None:
         """Register (or re-advertise) if a usable IP appeared or changed; otherwise do nothing."""
+        if self._closing:
+            return
         ip = self._detect_ip()
         if ip == _NO_IP or ip == self._current_ip:
             return
@@ -184,6 +193,10 @@ class CompanionAdvertiser:
                 _LOGGER.exception("mDNS address refresh failed; keeping the current advertisement")
 
     async def close(self) -> None:
+        # Set first so a poller iteration that wakes during teardown won't re-advertise after we
+        # unregister. (An executor zeroconf call already in flight can't be cancelled, but zconf.close()
+        # runs right after on the AsyncExitStack and tears everything down regardless.)
+        self._closing = True
         if self._task is not None:
             self._task.cancel()
             try:

@@ -22,6 +22,9 @@ class _FakeZeroconf:
         self.registered.append(info)
 
     def update_service(self, info):
+        # Real zeroconf asserts the ServiceInfo has a server on update (register backfills it, update
+        # does not). Mirror that so a regression in _build_info is caught here, not only on hardware.
+        assert info.server is not None, "update_service requires ServiceInfo.server to be set"
         self.updated.append(info)
 
     def unregister_service(self, info):
@@ -86,6 +89,24 @@ class TestCompanionAdvertiser(unittest.IsolatedAsyncioTestCase):
         await adv.refresh()
 
         self.assertEqual(len(zc.registered), 1)
+        self.assertEqual(zc.updated, [])
+
+    async def test_registered_info_carries_a_server(self):
+        # Regression guard for the update_service path: _build_info must set ServiceInfo.server (real
+        # zeroconf asserts on it for updates; register backfills it but we must not rely on that).
+        zc = _FakeZeroconf()
+        adv = _make(zc, lambda: "192.0.2.7")
+        await adv.refresh()
+        self.assertIsNotNone(zc.registered[0].server)
+
+    async def test_refresh_is_a_noop_after_close(self):
+        # A poll iteration that wakes during/after teardown must not re-advertise once closing.
+        zc = _FakeZeroconf()
+        ips = iter(["192.0.2.1", "192.0.2.9"])
+        adv = _make(zc, lambda: next(ips))
+        await adv.refresh()          # register .1
+        await adv.close()
+        await adv.refresh()          # would have updated to .9 — but we're closing, so no-op
         self.assertEqual(zc.updated, [])
 
     async def test_close_unregisters_and_stops_the_poller(self):
