@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
+from .atomic_io import atomic_write_text
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -67,9 +69,8 @@ class PairedClients:
     def _save(self) -> None:
         if not self._path:
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._clients))
-        self._path.chmod(0o600)
+        # Atomic + durable: a torn write here would corrupt the store and fail the next start closed.
+        atomic_write_text(self._path, json.dumps(self._clients), mode=0o600)
 
 
 def _is_str_dict(value: object) -> bool:

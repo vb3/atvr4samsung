@@ -75,6 +75,27 @@ class TestPairedClients(unittest.TestCase):
             self.assertEqual(reloaded.ltpk("dev"), b"\xaa\xbb")
             self.assertFalse(reloaded.empty())
 
+    def test_failed_save_leaves_previous_store_intact(self):
+        # A torn write while adding a second client must not corrupt the existing store.
+        from atvr4samsung.companion.protocol import atomic_io
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "paired-clients.json"
+            store = PairedClients(path)
+            store.add("dev-1", b"\x01")
+
+            original_replace = atomic_io.os.replace
+            atomic_io.os.replace = lambda src, dst: (_ for _ in ()).throw(OSError("crash"))
+            try:
+                with self.assertRaises(OSError):
+                    store.add("dev-2", b"\x02")
+            finally:
+                atomic_io.os.replace = original_replace
+
+            reloaded = PairedClients(path)
+            self.assertEqual(reloaded.ltpk("dev-1"), b"\x01")
+            self.assertIsNone(reloaded.ltpk("dev-2"))  # the failed add never landed on disk
+
 
 if __name__ == "__main__":
     unittest.main()
