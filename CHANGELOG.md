@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.8.0] - 2026-06-30
+
+A reliability/resiliency pass (Phase 1 of a performance/reliability sweep), plus a play/pause fix —
+the cumulative 0.7.1–0.7.8 work, reviewed and cut as a minor release. Validated on real hardware.
+
+### Fixed
+
+- **Play/Pause now works on a single press.** It maps to the Frame's real combined toggle key
+  `KEY_PLAY_BACK` (confirmed against the TV with media playing), instead of a software model that
+  alternated `KEY_PLAY`/`KEY_PAUSE` from a guessed state. The old model drifted out of sync — once
+  wrong (e.g. the TV was already playing on the first press) it stayed off-by-one, the "press twice to
+  take effect" bug. There is now no play-state to track, so it behaves like the physical remote's
+  button. (`KEY_PLAY_PAUSE`/`10252` is the in-app Tizen key, not a WebSocket key, and no-ops over the
+  socket; the WebSocket exposes no playback-state to query — both verified on hardware.)
+- **mDNS advert no longer goes stale after a DHCP/interface IP change.** The advertised LAN IPv4 was
+  detected once at startup; it's now polled and re-advertised on change (and registration is deferred
+  until a real, non-`0.0.0.0` address exists, instead of advertising `0.0.0.0` undiscoverably).
+- **Pairing state files are written atomically + durably.** `paired-clients.json` and
+  `server-identity.json` use a temp-file → `fsync` → `os.replace` → directory-`fsync` write, so a power
+  loss mid-write can't corrupt them; the 32-byte identity seed is no longer briefly written at the
+  umask default before `chmod 0600`.
+- **A corrupt `server-identity.json` now fails closed** with actionable guidance (run
+  `unpair --reset-identity`) instead of crashing unhandled or silently minting a new Apple-TV identity
+  (which would force the iPhone to re-pair and reopen PIN pairing).
+- **Samsung connect failures no longer leak a half-open remote** — `connect()` now closes the
+  partially-built client (socket + listener task) before clearing it.
+
+### Added
+
+- mDNS advertiser (`CompanionAdvertiser`) that keeps the advertised address current and tears down
+  cleanly on shutdown.
+- `scripts/build.sh` — one-command wheel build in a throwaway virtualenv (works where the uv-managed
+  `.venv` has no pip or the system pip is too old to read the project metadata).
+
+### Changed
+
+- Removed the `PlayPauseToggle` state model and `Action.PLAY_PAUSE_TOGGLE` (superseded by the single
+  `KEY_PLAY_BACK` key).
+
 ## [0.7.0] - 2026-06-30
 
 ### Fixed
