@@ -213,6 +213,7 @@ class SamsungFrameClient:
         return self
 
     async def close(self) -> None:
+        self._first_text_sent = False  # a fresh connection needs the text_received broadcast again
         if self._remote is not None:
             try:
                 await self._remote.close()
@@ -279,20 +280,30 @@ class SamsungFrameClient:
 
         Only works when the focused app uses the TV's system IME (global search, browser, settings);
         apps with their own keyboard (YouTube/Netflix) ignore it. ``SendInputString`` sets the whole
-        field, so callers pass the full current string each time.
+        field, so callers pass the full current string each time. Reconnects once on a dropped socket.
         """
-        from samsungtvws.remote import ChannelEmitCommand, SendInputString
-
         async with self._text_lock:  # keystrokes arrive fast; keep the field updates ordered
             await self._ensure_connected()
-            if not self._first_text_sent:
-                # Some TVs require this broadcast before accepting text input.
-                await self._remote.send_command(ChannelEmitCommand.text_received(), key_press_delay=0)
-                self._first_text_sent = True
-            # key_press_delay=0: samsungtvws otherwise sleeps ~1s after each send, which makes live
-            # typing crawl (one char/sec). Text input wants every keystroke through promptly.
-            await self._remote.send_command(SendInputString.send(text), key_press_delay=0)
+            try:
+                await self._send_text_once(text)
+            except Exception as exc:
+                _LOGGER.warning("send_text failed (%s); reconnecting once", type(exc).__name__)
+                await self.close()  # also resets _first_text_sent so the new field re-broadcasts
+                self._raise_if_connect_cooling_down()
+                await self.connect()
+                await self._send_text_once(text)
             _LOGGER.debug("Sent text (%d chars) to the TV field", len(text))
+
+    async def _send_text_once(self, text: str) -> None:
+        from samsungtvws.remote import ChannelEmitCommand, SendInputString
+
+        if not self._first_text_sent:
+            # Some TVs require this broadcast before accepting text input.
+            await self._remote.send_command(ChannelEmitCommand.text_received(), key_press_delay=0)
+            self._first_text_sent = True
+        # key_press_delay=0: samsungtvws otherwise sleeps ~1s after each send, which makes live typing
+        # crawl (one char/sec). Text input wants every keystroke through promptly.
+        await self._remote.send_command(SendInputString.send(text), key_press_delay=0)
 
     async def power_off(self) -> None:
         """Turn the TV off (KEY_POWER toggles, but from on this powers down)."""

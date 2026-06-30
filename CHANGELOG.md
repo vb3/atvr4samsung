@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.7.0] - 2026-06-30
+
+### Fixed
+
+- Keyboard: typing the **same text in a new field** is no longer dropped — the dedupe now compares
+  against the field's pre-keystroke value (which resets per field) instead of a sticky last-sent
+  string, so e.g. searching "news" twice in a row works.
+- Keyboard: `send_text` now reconnects once on a dropped socket (parity with button sends) and
+  re-broadcasts the IME `text_received` handshake after any reconnect, so a transient TV drop doesn't
+  silently swallow a keystroke.
+- Robustness: a stale/closed RTI client can no longer abort a keyboard-focus push to the live iPhone
+  (the broadcast now skips + prunes dead connections), and relayed text is clamped (deletion count
+  bounded, max length capped) against malformed input.
+
 ## [0.6.0] - 2026-06-29
 
 ### Added

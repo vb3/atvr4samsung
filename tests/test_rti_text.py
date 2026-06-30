@@ -109,12 +109,15 @@ class _TicHarness:
         svc = BridgeCompanionService.__new__(BridgeCompanionService)
         svc.state = FakeCompanionState()
         svc.state.rti_text = ""
-        svc._last_forwarded_text = None
         svc._dispatch_sink = lambda command: self.sent.append(command.text)
         self.svc = svc
 
     def feed(self, **op):
         self.svc.handle__tic(_tic_message(**op))
+
+    def new_field(self):
+        """Simulate a fresh TV field (imeStart resets the buffer)."""
+        self.svc.state.rti_text = ""
 
 
 class TestRtiTextOps(unittest.TestCase):
@@ -145,6 +148,21 @@ class TestRtiTextOps(unittest.TestCase):
         h.feed()                     # no insertion/deletion/assert -> unchanged
         h.feed()
         self.assertEqual(h.sent, ["a"])  # deduped, only the real change forwarded
+
+    def test_same_text_in_a_new_field_is_re_sent(self):
+        # Regression: dedupe is against the pre-op buffer (reset on imeStart), not a sticky last-sent,
+        # so the same word typed in a second field still forwards.
+        h = _TicHarness()
+        h.feed(insertion="a")        # field 1 -> "a"
+        h.new_field()                # focus a new field (imeStart resets rti_text)
+        h.feed(insertion="a")        # field 2 -> "a" again; must still forward
+        self.assertEqual(h.sent, ["a", "a"])
+
+    def test_negative_deletion_count_is_ignored(self):
+        h = _TicHarness()
+        h.feed(insertion="ab")
+        h.feed(deletion=-3)          # malformed -> clamp to 0, text unchanged -> no extra send
+        self.assertEqual(h.sent, ["ab"])
 
 
 class TestSendTextDispatch(unittest.IsolatedAsyncioTestCase):

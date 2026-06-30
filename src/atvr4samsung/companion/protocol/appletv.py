@@ -134,8 +134,21 @@ class FakeCompanionState:
                 )
 
     def _send_rti(self, identifier, content):
-        for client in self.rti_clients:
-            client.send_event(identifier, 1234, content)
+        # Copy + guard: a stale/closed client must not abort the broadcast (which would leave the live
+        # client without its _tiStarted while the focus state has already flipped). Prune dead ones.
+        for client in list(self.rti_clients):
+            transport = getattr(client, "transport", None)
+            if transport is None or getattr(transport, "is_closing", lambda: False)():
+                self.rti_clients.remove(client)
+                continue
+            try:
+                client.send_event(identifier, 1234, content)
+            except Exception:
+                _LOGGER.debug("RTI push failed for a client; pruning it")
+                try:
+                    self.rti_clients.remove(client)
+                except ValueError:
+                    pass
 
     @property
     def rti_focus_state(self) -> KeyboardFocusState:

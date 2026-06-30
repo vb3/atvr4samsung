@@ -62,6 +62,10 @@ _INITIAL_EVENT_PAYLOADS: dict[str, dict] = {
 # ``Command`` now lives in ``relay`` (re-exported above); kept importable from here for callers.
 Dispatch = Callable[[Command], Awaitable[None]]
 
+# Cap relayed RTI text so a malicious/runaway _tiC can't grow the buffer unbounded (system search
+# fields are short; this is generous headroom, well above the TV's typical entrylimit).
+_RTI_MAX_TEXT = 1024
+
 
 class BridgeCompanionService(FakeCompanionService):
     """The base server Apple TV, extended to relay commands to the Samsung bridge.
@@ -98,7 +102,6 @@ class BridgeCompanionService(FakeCompanionService):
         self._pressed_buttons = set()
         self._dispatch = dispatch
         self._relay = CommandRelay(self._dispatch_sink, gesture_config=gesture_config)
-        self._last_forwarded_text: Optional[str] = None  # dedupe RTI text so we don't re-send/loop
 
     # -- robustness: never let one bad frame drop a live session --------------
 
@@ -316,19 +319,24 @@ class BridgeCompanionService(FakeCompanionService):
 
         # iOS sends per-keystroke ops: an insertion (append), a deletionCount (backspace N chars), or a
         # textToAssert (full-field replace, e.g. autocorrect). It never echoes our session UUID, so we
-        # don't gate on it — we just rebuild the field value from our running buffer.
-        text = self.state.rti_text or ""
+        # don't gate on it — we rebuild the field value from our running buffer and dedupe against the
+        # PRE-op value (which resets to "" on each imeStart), so identical text in a new field still
+        # forwards while no-op sync frames don't.
+        old = self.state.rti_text or ""
+        text = old
         if text_to_assert is not None:
-            text = text_to_assert
+            text = str(text_to_assert)
         if deletion_count:
-            text = text[:-int(deletion_count)] if int(deletion_count) < len(text) else ""
+            n = max(0, min(int(deletion_count), len(text)))  # clamp: ignore negative/oversized counts
+            text = text[: len(text) - n]
         if insertion_text is not None:
-            text += insertion_text
+            text += str(insertion_text)
+        if len(text) > _RTI_MAX_TEXT:
+            text = text[:_RTI_MAX_TEXT]  # bound attacker/runaway growth
         self.state.rti_text = text
 
-        if text == self._last_forwarded_text:
-            return  # unchanged -> don't re-send (also breaks any focus/echo feedback loop)
-        self._last_forwarded_text = text
+        if text == old:
+            return  # no change (e.g. a periodic no-op _tiC) -> nothing to send
         _LOGGER.debug("RTI text -> %d chars", len(text))
         self._dispatch_sink(Command(Action.SEND_TEXT, text=text, source="rti"))
 

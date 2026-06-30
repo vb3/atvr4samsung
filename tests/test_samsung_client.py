@@ -276,6 +276,22 @@ class TestSamsungTextInput(unittest.IsolatedAsyncioTestCase):
         broadcasts = [type(c).__name__ for c in remote.sent_commands].count("ChannelEmitCommand")
         self.assertEqual(broadcasts, 2)
 
+    async def test_send_text_reconnects_once_on_failure_and_rebroadcasts(self):
+        from samsungtvws.remote import ChannelEmitCommand
+
+        first = FakeRemote(send_failures=1)   # the text_received broadcast fails on this connection
+        second = FakeRemote()
+        factory = FakeRemoteFactory(first, second)
+        client = make_client(factory)
+
+        await client.send_text("hello")
+
+        self.assertEqual(len(factory.calls), 2)       # reconnected once
+        self.assertTrue(first.closed)
+        # The new connection re-broadcasts text_received before the input string (flag reset on close).
+        self.assertIsInstance(second.sent_commands[0], ChannelEmitCommand)
+        self.assertEqual(type(second.sent_commands[1]).__name__, "SendInputString")
+
 
 if __name__ == "__main__":
     unittest.main()
