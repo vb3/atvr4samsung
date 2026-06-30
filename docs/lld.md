@@ -19,7 +19,7 @@ src/atvr4samsung/
     client.py            async Samsung Frame WebSocket client (samsungtvws) + Wake-on-LAN
   companion/
     server.py            BridgeCompanionService: subclass of the base server that relays to Samsung
-    discovery.py         mDNS advertisement of _companion-link._tcp (Apple-TV-like TXT records)
+    discovery.py         mDNS advert of _companion-link._tcp; CompanionAdvertiser re-advertises on IP change
     protocol/            first-party Companion Link implementation (derived from pyatv v0.18.0, MIT)
       appletv.py         base FakeCompanionService: framing, dispatch, HID/touch decode, session handlers
       auth.py            CompanionServerAuth: SRP-6a pair-setup (M1-M6) + Curve25519 pair-verify (M1-M4)
@@ -28,6 +28,7 @@ src/atvr4samsung/
       tlv8.py            HAP TLV8 codec
       enums.py           FrameType, HidCommand, MediaControlCommand, MediaControlFlags
       identity.py        device identity helpers
+      atomic_io.py       atomic_write_text(): durable, 0600, crash-safe writes for the JSON state files
       server_identity.py load_or_create_identity(): stable per-install UUID + Ed25519 key (persisted)
       paired_clients.py  PairedClients: persist/lookup client long-term public keys (pair-once enforcement)
       keyed_archiver.py  minimal NSKeyedArchiver reader (RTI/typed-character decode)
@@ -117,7 +118,9 @@ iPhone keyboard appears only when a TV text field is focused.
 > (`PageUp`/`PageDown`/`Mute`/`Power`) — it is the literal wire protocol, not the bridge's mapping.
 
 **Play/Pause:** `KEY_PLAY_BACK` is not a valid Tizen key on the Frame. `PlayPauseToggle` tracks state
-and emits `KEY_PLAY` or `KEY_PAUSE`.
+and emits `KEY_PLAY` or `KEY_PAUSE`. The flip is **committed only after a successful send**
+(`peek_next_key()` to choose the key, then `advance()` once `send_key` returns): a press that never
+reached the TV (asleep / cooling down) must not invert the toggle, or every later press would be wrong.
 
 **Gestures — `bridge/gestures.py` `SwipeTranslator`:** the modern remote primarily sends `_hidT`
 touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). The translator resolves a
@@ -163,6 +166,11 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   `Decrypt failed`. The server **closes the connection**; iOS reconnects and re-runs pair-verify
   automatically. (We considered server-side TCP keepalive but a tcpdump of an idle real-ATV
   connection showed **no** server keepalives, so we don't add any — Rapport drives liveness.)
+- **mDNS advertisement lifecycle (`discovery.py` `CompanionAdvertiser`):** the advertised LAN IPv4 is
+  no longer detected once at startup. The advertiser **defers** registration until a usable
+  (non-`0.0.0.0`) address exists, then **polls** the local IP (~45 s) and on change calls zeroconf
+  `update_service` — which keeps the existing registration live until the update lands, so there's no
+  discovery gap on a DHCP renewal / interface flap. It unregisters + stops the poller on shutdown.
 
 ## 7. Config & state
 
@@ -175,6 +183,13 @@ imported lazily so the dataclasses test without it.
 - `server-identity.json` — stable per-install UUID + Ed25519 private key (pairing survives restarts).
 - `paired-clients.json` — client LTPKs (pair-once enforcement).
 - `samsung-token.txt` — Samsung WebSocket token (first connect prompts Allow on the TV).
+
+Both JSON state files are written **atomically + durably** (`protocol/atomic_io.py`: sibling temp
+created 0600 → fsync → `os.replace` → directory fsync), so a torn write on the Pi's SD card can't
+corrupt them and the identity seed never lands at the umask default first. Reads **fail closed** on a
+corrupt file: the bridge refuses to start rather than silently re-allowing pairing
+(`paired-clients.json`) or minting a *new* Apple-TV identity (`server-identity.json`). `unpair`
+(`--reset-identity`) is the deliberate reset path.
 
 ## 8. Testing
 
