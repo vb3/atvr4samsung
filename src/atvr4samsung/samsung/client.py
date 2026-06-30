@@ -204,13 +204,26 @@ class SamsungFrameClient:
                 self._remote.start_listening(self._handle_tv_event), timeout=self.connect_timeout
             )
         except Exception as exc:
-            # Don't keep a half-open remote around: the next send_key() would skip reconnect.
-            self._remote = None
+            # Don't keep a half-open remote around: the next send_key() would skip reconnect. Close the
+            # partially-built remote first so a failed start_listening (timeout/refused/TLS) can't leak
+            # its open socket and background listener task. Swallow any secondary close error so it can't
+            # mask the real connect failure we're about to re-raise.
+            await self._discard_remote()
             self._last_connect_failed = True
             _LOGGER.warning("Samsung TV connection failed: %s", connect_failure_hint(exc))
             raise
         self._last_connect_failed = False
         return self
+
+    async def _discard_remote(self) -> None:
+        """Close and drop the current remote, suppressing close errors (used on connect failure)."""
+        remote, self._remote = self._remote, None
+        if remote is None:
+            return
+        try:
+            await remote.close()
+        except Exception:
+            _LOGGER.debug("Ignoring error while closing a half-open Samsung remote", exc_info=True)
 
     async def close(self) -> None:
         self._first_text_sent = False  # a fresh connection needs the text_received broadcast again

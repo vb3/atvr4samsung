@@ -228,6 +228,39 @@ class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):
         # Cleared so the next send_key()/_ensure_connected() actually reconnects.
         self.assertIsNone(client._remote)
 
+    async def test_connect_failure_closes_the_partial_remote(self):
+        # The remote was constructed (it may already hold an open socket) before start_listening failed;
+        # connect() must close it, not just drop the reference, or it leaks the socket + listener task.
+        remote = FailingStartRemote(ConnectionRefusedError("refused"))
+        client = make_client(FakeRemoteFactory(remote))
+
+        with self.assertRaises(ConnectionRefusedError):
+            await client.connect()
+
+        self.assertIsNone(client._remote)
+        self.assertTrue(remote.closed)
+        self.assertEqual(remote.started, 1)
+
+    async def test_connect_failure_suppresses_secondary_close_error(self):
+        # A blowup while closing the half-open remote must not mask the real connect failure.
+        class CloseRaises:
+            def __init__(self):
+                self.started = 0
+
+            async def start_listening(self, callback=None):
+                self.started += 1
+                raise asyncio.TimeoutError()
+
+            async def close(self):
+                raise RuntimeError("close blew up")
+
+        remote = CloseRaises()
+        client = make_client(lambda **kw: remote)
+
+        with self.assertRaises(asyncio.TimeoutError):  # the original error, not the close error
+            await client.connect()
+        self.assertIsNone(client._remote)
+
 
 class TestSamsungTextInput(unittest.IsolatedAsyncioTestCase):
     """IME callback wiring + SendInputString text entry (the keyboard-input feature)."""
