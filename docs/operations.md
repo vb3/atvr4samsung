@@ -66,8 +66,9 @@ Build the wheel from a checkout on a dev machine and copy it to the target. The 
 Python, so the wheel is portable across platforms:
 
 ```bash
-# optional: on a dev machine, in the repo:
-python -m build --wheel                        # produces dist/atvr4samsung-<ver>-py3-none-any.whl
+# on a dev machine, in the repo:
+bash scripts/build.sh                          # -> dist/atvr4samsung-<ver>-py3-none-any.whl
+# (override the interpreter if needed: PYTHON=python3.13 bash scripts/build.sh)
 ssh pi 'mkdir -p ~/atvr4samsung-wheel'
 scp dist/atvr4samsung-*.whl pi:~/atvr4samsung-wheel/
 
@@ -78,6 +79,9 @@ nano ~/.config/atvr4samsung/config.yaml
 atvr4samsung --check
 atvr4samsung install-service --apply
 ```
+
+`scripts/build.sh` builds inside a throwaway virtualenv with an upgraded pip, so it works even when
+the repo's uv-managed `.venv` has no pip or the system pip is too old to read the project metadata.
 
 ## 2. Configure
 
