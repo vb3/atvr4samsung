@@ -103,9 +103,10 @@ Update [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) whenever depende
 ## 9. Status & roadmap
 
 - **Working:** discovery, pair-once + signature verification, encrypted session, D-pad/Select/Menu/
-  Home, swipes, Play/Pause toggle, **Volume Up/Down + Mute**, **Power**, auto-reconnect on stale
-  session.
+  Home, swipes, Play/Pause toggle, **Volume Up/Down + Mute**, **Power**, **keyboard text entry into the
+  TV's system fields** (search/browser via the Tizen IME), auto-reconnect on stale session.
 - **Known limits:** Wake-on-LAN is unreliable on 2021+ Frames (magic packet often ignored even with
-  "Power On with Mobile" on) — see `operations.md`.
-- **Post-MVP:** RTI text entry → Samsung IME, app-launch shortcuts, Art-Mode toggle, now-playing
-  metadata back to the remote, Siri button handling.
+  "Power On with Mobile" on) — see `operations.md`. Keyboard input works only in apps that use the TV's
+  **system IME**; apps with their own keyboard (YouTube, Netflix) emit no IME events and ignore it.
+- **Post-MVP:** app-launch shortcuts, Art-Mode toggle, now-playing metadata back to the remote, Siri
+  button handling.

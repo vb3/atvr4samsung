@@ -48,6 +48,7 @@ class AppleButton(IntEnum):
 
 class Action(Enum):
     SEND_KEY = "send_key"
+    SEND_TEXT = "send_text"  # type text into a focused TV field (Tizen IME, system fields only)
     PLAY_PAUSE_TOGGLE = "play_pause_toggle"  # Frame has no KEY_PLAY_BACK; toggle play/pause
     POWER_OFF = "power_off"
     WAKE_ON_LAN = "wake_on_lan"

@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.6.0] - 2026-06-29
+
+### Added
+
+- **Keyboard text entry.** When a Samsung **system** text field is focused (Smart Hub search, web
+  browser, settings), the iPhone's on-screen keyboard now pops up automatically and what you type is
+  inserted on the TV — including backspace and autocorrect replacements. Driven by the TV's Tizen IME
+  (`ms.remote.imeStart`/`imeEnd`) mirrored to iOS RTI focus, with typed text relayed via
+  `SendInputString`. Apps that render their own keyboard (YouTube, Netflix) emit no IME events and are
+  not supported (confirmed on hardware). See `docs/lld.md` §9.
+
+### Changed
+
+- Remote feels snappier: button presses now pace the TV at **0.25s** (was the `samsungtvws` default of
+  1s), and keyboard keystrokes are sent with **no** delay so live typing keeps up. Configurable via
+  `SamsungFrameClient(key_press_delay=…)`.
+
 ## [0.5.0] - 2026-06-29
 
 ### Security

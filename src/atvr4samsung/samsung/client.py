@@ -27,6 +27,9 @@ KeyCommandBuilder = Callable[[str, str], Any]
 HoldCommandBuilder = Callable[[str, float], Any]
 WakeOnLanSender = Callable[[str], None]
 TimeFunction = Callable[[], float]
+# Called with each Tizen IME event name (e.g. ms.remote.imeStart/imeEnd) seen on the TV socket, so the
+# bridge can mirror the TV's text-field focus to the iPhone's on-screen keyboard.
+ImeEventHandler = Callable[[str, Any], None]
 
 
 _TIMEOUT_HINT = (
@@ -91,12 +94,14 @@ class SamsungFrameClient:
         wol_broadcast: str = "255.255.255.255",
         wol_port: int = 9,
         connect_timeout: float = 10.0,
+        key_press_delay: float = 0.25,
         remote_factory: Optional[RemoteFactory] = None,
         key_command_builder: Optional[KeyCommandBuilder] = None,
         hold_command_builder: Optional[HoldCommandBuilder] = None,
         wol_sender: Optional[WakeOnLanSender] = None,
         reconnect_min_interval: float = 3.0,
         time_fn: TimeFunction = time.monotonic,
+        on_ime_event: Optional[ImeEventHandler] = None,
     ) -> None:
         self.host = host
         self.mac = mac
@@ -107,6 +112,10 @@ class SamsungFrameClient:
         self.wol_broadcast = wol_broadcast
         self.wol_port = wol_port
         self.connect_timeout = connect_timeout
+        # Pacing the TV applies AFTER each command, so it only adds latency between rapid presses.
+        # samsungtvws defaults to 1s (very conservative); 0.25s keeps fast button taps responsive while
+        # still letting the Tizen TV register each command. Text sends override this to 0 (see send_text).
+        self.key_press_delay = key_press_delay
         self.reconnect_min_interval = reconnect_min_interval
         self._remote = None
         self._remote_factory = remote_factory
@@ -114,8 +123,15 @@ class SamsungFrameClient:
         self._hold_command_builder = hold_command_builder
         self._wol_sender = wol_sender
         self._time_fn = time_fn
+        self._on_ime_event = on_ime_event
+        self._first_text_sent = False  # some TVs need a text_received broadcast before the first insert
+        self._text_lock = asyncio.Lock()  # serialize rapid keystroke sends so the field stays ordered
         self._last_connect_attempt_at: Optional[float] = None
         self._last_connect_failed = False
+
+    def set_ime_event_handler(self, handler: Optional[ImeEventHandler]) -> None:
+        """Set/replace the handler invoked for each TV IME event (used to drive iPhone keyboard focus)."""
+        self._on_ime_event = handler
 
     def _build_remote(self) -> Any:
         if self._remote_factory is not None:
@@ -133,6 +149,7 @@ class SamsungFrameClient:
             port=self.port,
             name=self.name,
             token_file=self.token_file,
+            key_press_delay=self.key_press_delay,
         )
 
     @staticmethod
@@ -183,7 +200,9 @@ class SamsungFrameClient:
         self._last_connect_attempt_at = self._time_fn()
         try:
             self._remote = self._build_remote()
-            await asyncio.wait_for(self._remote.start_listening(), timeout=self.connect_timeout)
+            await asyncio.wait_for(
+                self._remote.start_listening(self._handle_tv_event), timeout=self.connect_timeout
+            )
         except Exception as exc:
             # Don't keep a half-open remote around: the next send_key() would skip reconnect.
             self._remote = None
@@ -242,6 +261,38 @@ class SamsungFrameClient:
         await self._ensure_connected()
         # SendRemoteKey.hold() returns a LIST (press, sleep, release) -> use send_commands.
         await self._remote.send_commands(self._build_hold_commands(key, seconds))
+
+    def _handle_tv_event(self, event: str, response: Any) -> None:
+        """Surface IME focus changes (and reset first-send state) as the TV opens/closes a field."""
+        if event in ("ms.remote.imeStart", "ms.remote.imeEnd"):
+            # The TV reopens its keyboard fresh each time, so the text_received broadcast must precede
+            # the first insert of each session (mirrors samsungtvws' own bookkeeping).
+            self._first_text_sent = False
+        if self._on_ime_event is not None:
+            try:
+                self._on_ime_event(event, response)
+            except Exception:
+                _LOGGER.exception("on_ime_event handler raised for %s", event)
+
+    async def send_text(self, text: str) -> None:
+        """Replace the focused TV text field's contents with ``text`` (Tizen IME ``SendInputString``).
+
+        Only works when the focused app uses the TV's system IME (global search, browser, settings);
+        apps with their own keyboard (YouTube/Netflix) ignore it. ``SendInputString`` sets the whole
+        field, so callers pass the full current string each time.
+        """
+        from samsungtvws.remote import ChannelEmitCommand, SendInputString
+
+        async with self._text_lock:  # keystrokes arrive fast; keep the field updates ordered
+            await self._ensure_connected()
+            if not self._first_text_sent:
+                # Some TVs require this broadcast before accepting text input.
+                await self._remote.send_command(ChannelEmitCommand.text_received(), key_press_delay=0)
+                self._first_text_sent = True
+            # key_press_delay=0: samsungtvws otherwise sleeps ~1s after each send, which makes live
+            # typing crawl (one char/sec). Text input wants every keystroke through promptly.
+            await self._remote.send_command(SendInputString.send(text), key_press_delay=0)
+            _LOGGER.debug("Sent text (%d chars) to the TV field", len(text))
 
     async def power_off(self) -> None:
         """Turn the TV off (KEY_POWER toggles, but from on this powers down)."""

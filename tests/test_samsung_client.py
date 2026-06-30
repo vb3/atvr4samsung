@@ -15,13 +15,13 @@ class FakeRemote:
         self.closed = False
         self.sent_commands = []
 
-    async def start_listening(self):
+    async def start_listening(self, callback=None):
         self.started += 1
 
     async def close(self):
         self.closed = True
 
-    async def send_command(self, command):
+    async def send_command(self, command, key_press_delay=None):
         self.sent_commands.append(command)
         if self.send_failures:
             self.send_failures -= 1
@@ -34,7 +34,7 @@ class FailingStartRemote:
         self.started = 0
         self.closed = False
 
-    async def start_listening(self):
+    async def start_listening(self, callback=None):
         self.started += 1
         raise self.exc
 
@@ -135,6 +135,10 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, [MAC])
 
+    def test_default_key_press_delay_is_responsive(self):
+        # Snappier than samsungtvws' 1s default, while still pacing the TV between rapid presses.
+        self.assertEqual(SamsungFrameClient(host="192.0.2.10", mac=MAC).key_press_delay, 0.25)
+
 
 class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):
     """A sleeping/unreachable TV must surface as a clean error and leave no half-open remote."""
@@ -194,7 +198,7 @@ class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_times_out_and_clears_remote(self):
         class HangRemote:
-            async def start_listening(self):
+            async def start_listening(self, callback=None):
                 await asyncio.sleep(60)
 
             async def close(self):
@@ -211,7 +215,7 @@ class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_error_propagates_and_clears_remote(self):
         class FailRemote:
-            async def start_listening(self):
+            async def start_listening(self, callback=None):
                 raise ConnectionRefusedError("refused")
 
             async def close(self):
@@ -223,6 +227,54 @@ class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):
             await client.connect()
         # Cleared so the next send_key()/_ensure_connected() actually reconnects.
         self.assertIsNone(client._remote)
+
+
+class TestSamsungTextInput(unittest.IsolatedAsyncioTestCase):
+    """IME callback wiring + SendInputString text entry (the keyboard-input feature)."""
+
+    async def test_ime_events_are_forwarded_to_the_handler(self):
+        seen = []
+        remote = FakeRemote()
+        client = SamsungFrameClient(
+            host="192.0.2.10", mac=MAC, remote_factory=lambda **kw: remote,
+            on_ime_event=lambda event, resp: seen.append(event),
+        )
+        await client.connect()
+
+        client._handle_tv_event("ms.remote.imeStart", {"data": "input"})
+        client._handle_tv_event("ms.channel.ping", {})
+
+        self.assertEqual(seen, ["ms.remote.imeStart", "ms.channel.ping"])
+
+    async def test_send_text_broadcasts_once_then_sends_input_string(self):
+        from samsungtvws.remote import ChannelEmitCommand, SendInputString
+
+        remote = FakeRemote()
+        client = SamsungFrameClient(host="192.0.2.10", mac=MAC, remote_factory=lambda **kw: remote)
+        await client.connect()
+
+        await client.send_text("ab")
+        await client.send_text("abc")  # same IME session -> no second broadcast
+
+        types = [type(c).__name__ for c in remote.sent_commands]
+        # First send: text_received broadcast + the string; second send: just the string.
+        self.assertEqual(types, ["ChannelEmitCommand", "SendInputString",
+                                 "SendInputString"])
+        self.assertIsInstance(remote.sent_commands[0], ChannelEmitCommand)
+        self.assertIsInstance(remote.sent_commands[1], SendInputString)
+
+    async def test_ime_start_resets_the_first_send_broadcast(self):
+        remote = FakeRemote()
+        client = SamsungFrameClient(host="192.0.2.10", mac=MAC, remote_factory=lambda **kw: remote)
+        await client.connect()
+
+        await client.send_text("ab")
+        # The TV opened a new field -> the next send must re-broadcast text_received.
+        client._handle_tv_event("ms.remote.imeStart", {"data": "input"})
+        await client.send_text("x")
+
+        broadcasts = [type(c).__name__ for c in remote.sent_commands].count("ChannelEmitCommand")
+        self.assertEqual(broadcasts, 2)
 
 
 if __name__ == "__main__":

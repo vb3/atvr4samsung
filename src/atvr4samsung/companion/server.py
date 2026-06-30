@@ -16,7 +16,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
-from .protocol.enums import FrameType, MediaControlCommand, MediaControlFlags
+from .protocol.enums import FrameType, KeyboardFocusState, MediaControlCommand, MediaControlFlags
 from .protocol.auth import CompanionServerAuth
 from .protocol import opack
 
@@ -98,6 +98,7 @@ class BridgeCompanionService(FakeCompanionService):
         self._pressed_buttons = set()
         self._dispatch = dispatch
         self._relay = CommandRelay(self._dispatch_sink, gesture_config=gesture_config)
+        self._last_forwarded_text: Optional[str] = None  # dedupe RTI text so we don't re-send/loop
 
     # -- robustness: never let one bad frame drop a live session --------------
 
@@ -268,19 +269,77 @@ class BridgeCompanionService(FakeCompanionService):
         self.send_response(message, {"_i": 1})
 
     def handle__tistart(self, message):  # noqa: N802
-        """Activate the text-input (RTI) session WITHOUT focusing a field, so iOS doesn't pop the
-        on-screen keyboard the moment the remote connects.
+        """Activate the text-input (RTI) session and register to receive focus pushes, but keep the
+        keyboard hidden until the TV actually opens a text field.
 
         The connection gate requires the text-input session to activate (a successful ``_tiStart``
-        reply sets iOS's ``textInputSessionActivated`` flag). The base server, however, defaults
-        its RTI focus state to *Focused* and replies with an encoded ``_tiD`` blob describing a
-        focused field seeded with placeholder text — which makes iOS immediately raise the keyboard.
-        We reply empty (unfocused): the session still activates, but no field is focused, so no
-        keyboard. Real RTI/typing is post-MVP (see docs/hld.md §9).
+        reply sets iOS's ``textInputSessionActivated`` flag). The base server defaults its RTI focus
+        state to *Focused* and replies with an encoded ``_tiD`` blob seeded with placeholder text,
+        which makes iOS raise the keyboard the moment the remote connects. Instead we establish the
+        session (UUID + register as an RTI client) and reply **unfocused** (empty), so no keyboard
+        shows yet; later, when the Samsung TV emits ``ms.remote.imeStart``, we flip focus to push a
+        ``_tiStarted`` and the iPhone keyboard appears. See ``make_ime_focus_handler``.
         """
         if message.get("_t") != 2:
             return
+        self.state.rti_session_uuid = b"0123456789abcdef"
+        self.state.rti_text = ""
+        # Baseline unfocused BEFORE registering, so the later Unfocused->Focused transition fires
+        # _tiStarted to us (the focus setter only sends on an actual state change).
+        self.state.rti_focus_state = KeyboardFocusState.Unfocused
+        if self not in self.state.rti_clients:
+            self.state.rti_clients.append(self)
         self.send_response(message, {})
+
+    def handle__tic(self, message):  # noqa: N802
+        """Forward text the user typed on the iPhone into the focused Samsung TV field.
+
+        We decode the RTI text operation ourselves (rather than the base's strict session-UUID gate)
+        and rebuild the full field value, then forward it. ``SendInputString`` replaces the whole
+        field, so we send the full string and dedupe to avoid re-sending unchanged text. Only effective
+        while the TV's system IME is active (system search/browser; YouTube uses its own keyboard).
+        """
+        if message.get("_t") != 1:
+            return
+        try:
+            from .protocol import keyed_archiver
+
+            text_to_assert, insertion_text, deletion_count = keyed_archiver.read_archive_properties(
+                message["_c"]["_tiD"],
+                ["textOperations", "textToAssert"],
+                ["textOperations", "keyboardOutput", "insertionText"],
+                ["textOperations", "keyboardOutput", "deletionCount"],
+            )
+        except Exception:
+            _LOGGER.exception("Failed to decode RTI _tiC")
+            return
+
+        # iOS sends per-keystroke ops: an insertion (append), a deletionCount (backspace N chars), or a
+        # textToAssert (full-field replace, e.g. autocorrect). It never echoes our session UUID, so we
+        # don't gate on it — we just rebuild the field value from our running buffer.
+        text = self.state.rti_text or ""
+        if text_to_assert is not None:
+            text = text_to_assert
+        if deletion_count:
+            text = text[:-int(deletion_count)] if int(deletion_count) < len(text) else ""
+        if insertion_text is not None:
+            text += insertion_text
+        self.state.rti_text = text
+
+        if text == self._last_forwarded_text:
+            return  # unchanged -> don't re-send (also breaks any focus/echo feedback loop)
+        self._last_forwarded_text = text
+        _LOGGER.debug("RTI text -> %d chars", len(text))
+        self._dispatch_sink(Command(Action.SEND_TEXT, text=text, source="rti"))
+
+    def connection_lost(self, exc):
+        # Base clears transport + state.clients but not rti_clients; drop our registration so a stale
+        # connection can't keep receiving focus pushes.
+        try:
+            if self in self.state.rti_clients:
+                self.state.rti_clients.remove(self)
+        finally:
+            super().connection_lost(exc)
 
     def handle__interest(self, message):  # noqa: N802
         """Push an initial state event when iOS subscribes to one.
@@ -330,7 +389,11 @@ class BridgeCompanionService(FakeCompanionService):
         The relay is synchronous (it runs inside a protocol handler); fire the dispatch as a task so
         a slow Samsung call can't block the Companion frame loop.
         """
-        _LOGGER.info("Relay %s (%s)", command.action.value, command.source)
+        # Text fires per keystroke — keep it at DEBUG so typing doesn't flood the log.
+        if command.action is Action.SEND_TEXT:
+            _LOGGER.debug("Relay text (%s)", command.source)
+        else:
+            _LOGGER.info("Relay %s (%s)", command.action.value, command.source)
         if self._dispatch is None:
             return
         self.loop.create_task(self._safe_dispatch(command))
@@ -340,6 +403,27 @@ class BridgeCompanionService(FakeCompanionService):
             await self._dispatch(command)
         except Exception:
             _LOGGER.exception("Dispatch failed for %s", command)
+
+
+def make_ime_focus_handler(state: FakeCompanionState):
+    """Build a Samsung-IME-event handler that mirrors the TV's text-field focus to the iPhone.
+
+    Wired into the Samsung client; called (in the event loop) for each ``ms.remote.ime*`` event. When
+    the TV focuses a system text field it emits ``imeStart`` -> we push RTI focus so the iPhone
+    keyboard appears; ``imeEnd`` -> we unfocus so it dismisses. No-op until the iPhone has an active
+    RTI session (``_tiStart``), so we never focus into the void.
+    """
+    def handle(event: str, response=None) -> None:
+        if event == "ms.remote.imeStart":
+            if state.rti_session_uuid is None or not state.rti_clients:
+                return
+            if state.rti_focus_state != KeyboardFocusState.Focused:
+                state.rti_text = ""
+                state.rti_focus_state = KeyboardFocusState.Focused
+        elif event == "ms.remote.imeEnd":
+            state.rti_focus_state = KeyboardFocusState.Unfocused
+
+    return handle
 
 
 def make_samsung_dispatch(client, toggle: Optional[PlayPauseToggle] = None) -> Dispatch:
@@ -353,6 +437,8 @@ def make_samsung_dispatch(client, toggle: Optional[PlayPauseToggle] = None) -> D
     async def dispatch(command: Command) -> None:
         if command.action is Action.SEND_KEY and command.samsung_key:
             await client.send_key(command.samsung_key, command.cmd)
+        elif command.action is Action.SEND_TEXT and command.text is not None:
+            await client.send_text(command.text)
         elif command.action is Action.PLAY_PAUSE_TOGGLE:
             await client.send_key(toggle.next_key())
         elif command.action is Action.POWER_OFF:

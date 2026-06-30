@@ -34,6 +34,7 @@ class Command:
     samsung_key: Optional[str] = None
     cmd: str = "Click"  # Click / Press / Release
     source: str = ""  # debug provenance, e.g. "button:6" or "gesture:RIGHT"
+    text: Optional[str] = None  # full field contents for Action.SEND_TEXT
 
 
 def volume_key_for(prev_volume_pct: float, new_level: float) -> Tuple[str, float]:

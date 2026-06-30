@@ -105,6 +105,9 @@ logging: { level: "INFO" }           # DEBUG to see decoded Companion frames + S
 1. On the iPhone: Control Center → **Apple TV Remote** → pick **Frame Living Room** → enter the PIN.
 2. D-pad/Select/Menu/Home, swipes, Play/Pause, **Volume/Mute**, and **Power** drive the Frame.
 3. First Samsung connect: **accept the Allow prompt on the TV** (the token is then persisted).
+4. **Keyboard:** focus a TV **system** text field (Smart Hub search, web browser) and the iPhone
+   keyboard pops up automatically — type and it appears on the TV. Note: apps with their own keyboard
+   (**YouTube, Netflix**) don't use the TV's system keyboard, so typing into them isn't supported.
 
 **Preflight:** run `atvr4samsung doctor` for a network-aware check (config placeholders, local IP,
 Companion port bind, state-dir/token-path writability, mDNS publishability, and TV reachability) — it
@@ -173,6 +176,7 @@ dedicated-user deployment, adapt the reference unit and point `state_dir` at its
 | **Remote won't reconnect after idle** | A stale connection desynced its crypto; the server now closes it so the phone re-pairs. If it lingers, force-close the remote (or toggle Wi-Fi) once. Look for `Decrypt failed (stale pairing?); closing connection` in the log — recovery is automatic. |
 | **Volume/Mute greyed out** | Ensure `model: AppleTV14,1` and the advert's `rpFl` has bit 8 (`0x36782`). The server must answer `FetchMediaControlStatus` with `{"MediaControlFlags": 256}` (not `_mcF`). See `lld.md` §5. |
 | **Mute does nothing but Volume works** | Mute's wire code is `_hidC` **18**, not 29 — confirm `keymap.py` maps 18 → `KEY_MUTE`. |
+| **iPhone keyboard doesn't type into an app (e.g. YouTube)** | Expected — that app uses its own on-screen keyboard and emits no Tizen IME events. Keyboard input works only in **system** fields (Smart Hub search, web browser, settings). See `lld.md` §9. |
 | **Device not listed on the iPhone** | mDNS reflector must forward `_companion-link._tcp` (with TXT records) to the phone's VLAN, and the phone must reach the Pi's Companion TCP port. Run `atvr4samsung doctor` to check mDNS publishability + the port; confirm on the network with `avahi-browse -ptr _companion-link._tcp`. |
 | **Pairing rejected after re-flashing / new identity** | The phone has an old pairing. Run `atvr4samsung unpair --reset-identity` (clears server identity + paired clients in `state_dir`), then "Forget This Remote" on the iPhone and pair again. |
 | **Service refuses to start: "paired-clients.json … is corrupt"** | The paired-client store was corrupted; the bridge fails closed rather than silently re-allowing pairing. Run `atvr4samsung unpair` to clear it, then re-pair the iPhone. |

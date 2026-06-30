@@ -75,11 +75,18 @@ overrides handlers to relay decoded commands. Notable overrides:
 - `handle_tvrcsessionstart` / `handle_fetchmediacontrolstatus` / `handle__interest` — advertise media
   control (see §5).
 - `handle_mediacontrolcommand` — iOS-26 `MediaControlCommand` flow (GetVolume/SetVolume/captions).
-- `handle__tistart` — reply **unfocused** so iOS doesn't pop the on-screen keyboard on connect (RTI is
-  post-MVP).
+- `handle__tistart` — establish the RTI text-input session and register as an RTI client, but reply
+  **unfocused** so iOS doesn't pop the keyboard on connect; focus is driven later by the TV's IME.
+- `handle__tic` — decode the iOS text operation (insert / `deletionCount` backspace / `textToAssert`
+  replace), rebuild the full field string, and forward it to `client.send_text` (deduped). iOS does
+  **not** echo our RTI session UUID, so we don't gate on it. See §9.
+- `connection_lost` — drop our RTI-client registration (the base only clears `clients`), then defer to
+  the base.
 
 `make_samsung_dispatch(client)` builds the async dispatch that turns a resolved `Command` into a
-Samsung call (`send_key`, play/pause toggle, `power_off`, `wake`).
+Samsung call (`send_key`, `send_text`, play/pause toggle, `power_off`, `wake`).
+`make_ime_focus_handler(state)` mirrors the TV's `ms.remote.imeStart`/`imeEnd` to RTI focus so the
+iPhone keyboard appears only when a TV text field is focused.
 
 ## 4. Command & gesture mapping
 
@@ -176,3 +183,32 @@ stdlib only — no TV, no phone, no network, no Apple-protocol deps. Run `python
 coverage of note: `tests/test_media_control.py` (modern `MediaControlFlags` key) and
 `tests/test_keymap.py` (Mute = HID 18). Hardware-dependent checks are not unit-tested and are never
 gated behind pytest. See [`../AGENTS.md`](../AGENTS.md) for the full testing philosophy.
+
+## 9. Keyboard / text input (system fields only)
+
+Typing on the iPhone is relayed to a focused Samsung text field via the TV's **system IME**. The loop:
+
+1. **TV focuses a field** → Samsung emits `ms.remote.imeStart` (and `imeEnd` on blur). The
+   `SamsungFrameClient` passes a callback into `start_listening`; `make_ime_focus_handler` maps these
+   to RTI focus.
+2. **Pop the iPhone keyboard** → setting `state.rti_focus_state = Focused` pushes a `_tiStarted` to the
+   registered RTI client; `imeEnd` → `Unfocused`. We only focus when an RTI session exists (so we never
+   focus into the void), and we skip re-pushing when already focused (avoids an echo/focus loop).
+3. **User types** → iOS sends `_tiC` text operations. `handle__tic` decodes one of: an `insertionText`
+   (append), a `keyboardOutput.deletionCount` (**backspace** N chars), or a `textToAssert` (full
+   replace), rebuilds the full field value, dedupes, and forwards it.
+4. **Insert into the TV field** → `client.send_text` sends `SendInputString` (base64), preceded once by
+   a `text_received` broadcast that some TVs require. `SendInputString` replaces the **whole** field, so
+   we always send the full current string.
+
+Hard-won wire facts (captured from a real iPhone, iOS 26, against the Frame TV):
+- iOS does **not** echo our RTI `sessionUUID` in `_tiC` (it comes back `None`), so the base server's
+  strict UUID gate dropped all text — `handle__tic` decodes without gating on it.
+- A keystroke is a single-char `insertionText`; a **backspace** carries
+  `keyboardOutput.deletionCount` with `producedByDeleteInput: True` and **no** `insertionText`.
+- **App limitation:** only apps using the Tizen **system IME** participate (global/Smart Hub search,
+  web browser, settings). **YouTube/Netflix render their own keyboards and emit no IME events**, so
+  typing there does nothing — confirmed on hardware.
+- **Latency:** `samsungtvws` sleeps `key_press_delay` (default 1s) after every command. Text sends pass
+  `key_press_delay=0` (live typing must be prompt); normal button presses default to **0.25s** (paces
+  the TV without dropping rapid presses).

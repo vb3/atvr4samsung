@@ -12,8 +12,9 @@ remote — no custom app, no jailbreak.
 > for Samsung" — drive a Samsung TV with the iPhone's built-in Apple TV Remote.
 
 > **Status: working.** A real iPhone (iOS 26) pairs with the emulated Apple TV, the remote stays
-> connected, and D-pad/Select/Menu/Home/Play-Pause + swipes + **Volume/Mute** + **Power** drive the
-> Frame. The Apple-side server is a first-party Companion Link implementation (originally derived from
+> connected, and D-pad/Select/Menu/Home/Play-Pause + swipes + **Volume/Mute** + **Power** + **keyboard
+> text entry** (into the TV's system search/browser fields) drive the Frame. The Apple-side server is a
+> first-party Companion Link implementation (originally derived from
 > [pyatv](https://github.com/postlund/pyatv), MIT), with pair-once auth hardening. See
 > [`docs/hld.md`](docs/hld.md) and [`docs/lld.md`](docs/lld.md) for the design and the iOS-26
 > capability gates, and [`docs/operations.md`](docs/operations.md) to install/run/troubleshoot.

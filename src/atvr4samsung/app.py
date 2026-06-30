@@ -77,7 +77,7 @@ async def run(config: Config) -> None:
     from .companion.discovery import advertise_companion
     from .companion.protocol.paired_clients import PairedClients
     from .companion.protocol.server_identity import load_or_create_identity
-    from .companion.server import make_samsung_dispatch, serve
+    from .companion.server import make_ime_focus_handler, make_samsung_dispatch, serve
     from .samsung.client import SamsungFrameClient
 
     _LOGGER.info("Starting the bridge.")
@@ -101,7 +101,7 @@ async def run(config: Config) -> None:
         stack.push_async_callback(client.close)  # always clean up, even though connect is deferred
 
         dispatch = make_samsung_dispatch(client)
-        server, _state = await serve(
+        server, state = await serve(
             dispatch,
             host="0.0.0.0",
             port=config.companion.port,
@@ -112,6 +112,8 @@ async def run(config: Config) -> None:
             paired_clients=paired,
             require_paired=True,
         )
+        # Mirror the TV's text-field focus to the iPhone keyboard (system fields only; see operations).
+        client.set_ime_event_handler(make_ime_focus_handler(state))
         bound_port = server.sockets[0].getsockname()[1]
 
         async def close_server() -> None:
