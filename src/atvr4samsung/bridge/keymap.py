@@ -49,7 +49,6 @@ class AppleButton(IntEnum):
 class Action(Enum):
     SEND_KEY = "send_key"
     SEND_TEXT = "send_text"  # type text into a focused TV field (Tizen IME, system fields only)
-    PLAY_PAUSE_TOGGLE = "play_pause_toggle"  # Frame has no KEY_PLAY_BACK; toggle play/pause
     POWER_OFF = "power_off"
     WAKE_ON_LAN = "wake_on_lan"
     UNMAPPED = "unmapped"
@@ -78,12 +77,16 @@ KEYMAP: Dict[AppleButton, Mapping] = {
     # iOS 26 sends Mute as _hidC 18 (raw PageUp), not decompiled button id 29.
     AppleButton.Mute: Mapping(Action.SEND_KEY, "KEY_MUTE", mvp=True, note="iOS 26 CC Mute"),
 
-    # Play / pause: the Frame has no combined key, so we toggle KEY_PLAY/KEY_PAUSE.
+    # Play / pause: KEY_PLAY_BACK is a real single play/pause TOGGLE on the Frame (confirmed against a
+    # real TV with media playing — it pauses, then resumes). It's forwarded to the focused app like any
+    # media key, so it works wherever KEY_PLAY/KEY_PAUSE do, but as one stateless key — no internal
+    # play-state model to drift out of sync (the cause of the old "press twice to take effect" bug).
+    # NB: KEY_PLAY_PAUSE / code 10252 is the in-app Tizen TVInputDevice name, NOT a WebSocket key.
     AppleButton.PlayPause: Mapping(
-        Action.PLAY_PAUSE_TOGGLE,
-        None,
+        Action.SEND_KEY,
+        "KEY_PLAY_BACK",
         mvp=True,
-        note="KEY_PLAY_BACK invalid on this TV; toggle KEY_PLAY/KEY_PAUSE",
+        note="single play/pause toggle (confirmed on Frame); supersedes the old toggle model",
     ),
 
     # iOS 26 sends Power as _hidC 19 (raw PageDown); Sleep powers off, Wake sends WoL.
@@ -118,39 +121,3 @@ GESTURE_TO_SAMSUNG: Dict[str, str] = {
     "RIGHT": "KEY_RIGHT",
     "SELECT": "KEY_ENTER",
 }
-
-
-class PlayPauseToggle:
-    """Synthesizes a single Apple Play/Pause button on the Frame TV.
-
-    The Frame exposes only discrete ``KEY_PLAY`` / ``KEY_PAUSE`` (no combined toggle key), so we model
-    the state ourselves. Starts assuming the content is *paused*, so the first press issues
-    ``KEY_PLAY``.
-    """
-
-    def __init__(self, initially_playing: bool = False) -> None:
-        self._playing = initially_playing
-
-    @property
-    def playing(self) -> bool:
-        return self._playing
-
-    def peek_next_key(self) -> str:
-        """The key the next press will send, WITHOUT advancing the toggle (commit via :meth:`advance`).
-
-        Lets the caller send to the TV first and flip state only on success, so a send that never
-        reached the TV (asleep/cooling down) can't invert play/pause and desync every later press.
-        """
-        return "KEY_PAUSE" if self._playing else "KEY_PLAY"
-
-    def advance(self) -> None:
-        """Flip play/pause state. Call only after the corresponding key was sent successfully."""
-        self._playing = not self._playing
-
-    def next_key(self) -> str:
-        key = self.peek_next_key()
-        self.advance()
-        return key
-
-    def set_playing(self, playing: bool) -> None:
-        self._playing = playing

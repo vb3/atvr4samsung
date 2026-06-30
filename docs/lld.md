@@ -13,7 +13,7 @@ src/atvr4samsung/
   app.py                 console entry point: load config, connect Samsung, serve Companion, advertise mDNS
   config.py              typed config (dataclasses); PyYAML imported lazily so the cores test without it
   bridge/
-    keymap.py            Apple _hidC button code -> Samsung KEY_* mapping + PlayPauseToggle   (pure)
+    keymap.py            Apple _hidC button code -> Samsung KEY_* mapping (incl. play/pause toggle)  (pure)
     gestures.py          _hidT touch points -> discrete swipe/tap direction state machine     (pure)
   samsung/
     client.py            async Samsung Frame WebSocket client (samsungtvws) + Wake-on-LAN
@@ -85,7 +85,8 @@ overrides handlers to relay decoded commands. Notable overrides:
   the base.
 
 `make_samsung_dispatch(client)` builds the async dispatch that turns a resolved `Command` into a
-Samsung call (`send_key`, `send_text`, play/pause toggle, `power_off`, `wake`).
+Samsung call (`send_key`, `send_text`, `power_off`, `wake`). Play/pause is just a `send_key`
+(`KEY_PLAY_BACK`), so the dispatch holds no toggle state.
 `make_ime_focus_handler(state)` mirrors the TV's `ms.remote.imeStart`/`imeEnd` to RTI focus so the
 iPhone keyboard appears only when a TV text field is focused.
 
@@ -101,7 +102,7 @@ iPhone keyboard appears only when a TV text field is focused.
 | 7 | Home | `KEY_HOME` | |
 | 8 | Volume Up | `KEY_VOLUP` | iOS-26 CC volume |
 | 9 | Volume Down | `KEY_VOLDOWN` | iOS-26 CC volume |
-| 14 | Play/Pause | `KEY_PLAY`/`KEY_PAUSE` | toggle (no combined key on this TV) |
+| 14 | Play/Pause | `KEY_PLAY_BACK` | single stateless play/pause toggle (confirmed on the Frame) |
 | **18** | **Mute** (CC) | `KEY_MUTE` | iOS-26 CC Mute wire code is 18 (raw HID `PageUp`) — `AppleButton.Mute = 18` |
 | **19** | **Power** (CC) | `KEY_POWER` | iOS-26 CC Power wire code is 19 (raw HID `PageDown`) — `AppleButton.Power = 19` |
 | 12 | Sleep | `KEY_POWER` (off) | |
@@ -117,10 +118,15 @@ iPhone keyboard appears only when a TV text field is focused.
 > Note: the protocol enum `companion/protocol/enums.py::HidCommand` keeps the **raw** HID names
 > (`PageUp`/`PageDown`/`Mute`/`Power`) — it is the literal wire protocol, not the bridge's mapping.
 
-**Play/Pause:** `KEY_PLAY_BACK` is not a valid Tizen key on the Frame. `PlayPauseToggle` tracks state
-and emits `KEY_PLAY` or `KEY_PAUSE`. The flip is **committed only after a successful send**
-(`peek_next_key()` to choose the key, then `advance()` once `send_key` returns): a press that never
-reached the TV (asleep / cooling down) must not invert the toggle, or every later press would be wrong.
+**Play/Pause:** `KEY_PLAY_BACK` is a real **single play/pause toggle** on the Frame — confirmed against
+a real TV with media playing (it pauses, then a second press resumes, cleanly across repeated presses).
+It's forwarded to the focused app like any media key, so it works wherever `KEY_PLAY`/`KEY_PAUSE` do,
+but as **one stateless key** — there is no internal play-state model to drift out of sync. (This
+supersedes the earlier belief that `KEY_PLAY_BACK` was invalid + a `PlayPauseToggle` that alternated
+`KEY_PLAY`/`KEY_PAUSE`; that model started from a guessed state and, once wrong, stayed off-by-one — the
+"press twice to take effect" bug.) **NB:** `KEY_PLAY_PAUSE` / code `10252` is the in-app Tizen
+`TVInputDevice` name, **not** a WebSocket `ms.remote.control` key — it no-ops over the WebSocket
+(verified on the Frame), so don't use it.
 
 **Gestures — `bridge/gestures.py` `SwipeTranslator`:** the modern remote primarily sends `_hidT`
 touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). The translator resolves a

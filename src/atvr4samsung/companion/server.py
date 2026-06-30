@@ -29,7 +29,7 @@ from .protocol.appletv import (
 )
 
 from ..bridge.gestures import TOUCH_ACTION_NAMES, GestureConfig
-from ..bridge.keymap import Action, PlayPauseToggle
+from ..bridge.keymap import Action
 from .relay import Command, CommandRelay, volume_key_for
 
 _LOGGER = logging.getLogger(__name__)
@@ -434,26 +434,17 @@ def make_ime_focus_handler(state: FakeCompanionState):
     return handle
 
 
-def make_samsung_dispatch(client, toggle: Optional[PlayPauseToggle] = None) -> Dispatch:
+def make_samsung_dispatch(client) -> Dispatch:
     """Build a :data:`Dispatch` that drives a :class:`~atvr4samsung.samsung.client.SamsungFrameClient`.
 
-    ``client`` is an (already-connected) ``SamsungFrameClient``. The play/pause toggle state lives
-    here so a single Apple Play/Pause button alternates ``KEY_PLAY`` / ``KEY_PAUSE``.
+    ``client`` is an (already-connected) ``SamsungFrameClient``. Play/pause is a single stateless TV
+    key (``KEY_PLAY_BACK``, mapped in ``bridge/keymap.py``), so there's no toggle state to track here.
     """
-    toggle = toggle or PlayPauseToggle()
-
     async def dispatch(command: Command) -> None:
         if command.action is Action.SEND_KEY and command.samsung_key:
             await client.send_key(command.samsung_key, command.cmd)
         elif command.action is Action.SEND_TEXT and command.text is not None:
             await client.send_text(command.text)
-        elif command.action is Action.PLAY_PAUSE_TOGGLE:
-            key = toggle.peek_next_key()
-            await client.send_key(key)
-            # Commit the play/pause flip only after the send succeeds: if send_key raised (TV asleep /
-            # cooling down) we never reach here, so the toggle stays put and the next press retries the
-            # same key instead of silently inverting.
-            toggle.advance()
         elif command.action is Action.POWER_OFF:
             await client.power_off()
         elif command.action is Action.WAKE_ON_LAN:

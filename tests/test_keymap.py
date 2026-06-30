@@ -5,7 +5,6 @@ from atvr4samsung.bridge.keymap import (
     GESTURE_TO_SAMSUNG,
     Action,
     AppleButton,
-    PlayPauseToggle,
     resolve,
 )
 
@@ -31,11 +30,12 @@ class TestKeymapResolution(unittest.TestCase):
             self.assertEqual(mapping.samsung_key, key, button)
             self.assertTrue(mapping.mvp, f"{button} should be in the MVP set")
 
-    def test_play_pause_is_a_toggle_not_a_raw_key(self):
+    def test_play_pause_is_a_single_toggle_key(self):
+        # KEY_PLAY_BACK is a real single play/pause toggle on the Frame (confirmed against the real TV),
+        # so we send it as one stateless key — no internal play-state model to drift out of sync.
         mapping = resolve(int(AppleButton.PlayPause))
-        self.assertEqual(mapping.action, Action.PLAY_PAUSE_TOGGLE)
-        # Must NOT be sent as a literal key — the Frame has no combined play/pause key.
-        self.assertIsNone(mapping.samsung_key)
+        self.assertEqual(mapping.action, Action.SEND_KEY)
+        self.assertEqual(mapping.samsung_key, "KEY_PLAY_BACK")
         self.assertTrue(mapping.mvp)
 
     def test_sleep_powers_off_and_wake_uses_wol(self):
@@ -86,29 +86,8 @@ class TestKeymapResolution(unittest.TestCase):
             if mapping.action is Action.SEND_KEY:
                 self.assertTrue(mapping.samsung_key, f"{button} SEND_KEY missing key")
                 self.assertTrue(mapping.samsung_key.startswith("KEY_"), button)
-            elif mapping.action in (Action.PLAY_PAUSE_TOGGLE, Action.WAKE_ON_LAN, Action.UNMAPPED):
+            elif mapping.action in (Action.WAKE_ON_LAN, Action.UNMAPPED):
                 self.assertIsNone(mapping.samsung_key, f"{button} should carry no raw key")
-
-
-class TestPlayPauseToggle(unittest.TestCase):
-    def test_first_press_from_paused_plays_then_alternates(self):
-        toggle = PlayPauseToggle()
-        self.assertEqual(toggle.next_key(), "KEY_PLAY")
-        self.assertTrue(toggle.playing)
-        self.assertEqual(toggle.next_key(), "KEY_PAUSE")
-        self.assertFalse(toggle.playing)
-        self.assertEqual(toggle.next_key(), "KEY_PLAY")
-
-    def test_starting_playing_pauses_first(self):
-        toggle = PlayPauseToggle(initially_playing=True)
-        self.assertEqual(toggle.next_key(), "KEY_PAUSE")
-        self.assertFalse(toggle.playing)
-
-    def test_set_playing_syncs_external_state(self):
-        toggle = PlayPauseToggle()
-        # Simulate playback started outside the remote; the next press should pause.
-        toggle.set_playing(True)
-        self.assertEqual(toggle.next_key(), "KEY_PAUSE")
 
 
 class TestGestureSamsungMap(unittest.TestCase):

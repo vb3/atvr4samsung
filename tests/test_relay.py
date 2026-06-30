@@ -50,6 +50,14 @@ class TestButtonDecode(unittest.TestCase):
         relay.on_button(9999, 2)
         self.assertEqual(sink, [])
 
+    def test_play_pause_resolves_to_single_toggle_key(self):
+        # Button 14 (Play/Pause) -> KEY_PLAY_BACK, a real stateless toggle on the Frame (no model).
+        relay, sink, _ = _relay()
+        relay.on_button(14, 2)  # release
+        self.assertEqual(len(sink), 1)
+        self.assertEqual(sink[0].action, Action.SEND_KEY)
+        self.assertEqual(sink[0].samsung_key, "KEY_PLAY_BACK")
+
 
 class TestSelectDedupe(unittest.TestCase):
     def test_duplicate_select_within_window_is_dropped(self):
