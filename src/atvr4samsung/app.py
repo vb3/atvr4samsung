@@ -74,7 +74,7 @@ async def run(config: Config) -> None:
     # Imported lazily so `--check` and tests don't require the runtime deps (samsungtvws).
     from zeroconf import Zeroconf
 
-    from .companion.discovery import advertise_companion
+    from .companion.discovery import CompanionAdvertiser
     from .companion.protocol.paired_clients import PairedClients
     from .companion.protocol.server_identity import load_or_create_identity
     from .companion.server import make_ime_focus_handler, make_samsung_dispatch, serve
@@ -123,22 +123,19 @@ async def run(config: Config) -> None:
         stack.push_async_callback(close_server)
 
         loop = asyncio.get_event_loop()
-        local_ip = _detect_local_ip(config.samsung.host)
-        if local_ip == "0.0.0.0":
-            # Advertising 0.0.0.0 over mDNS makes us undiscoverable; the iPhone needs a real LAN IP.
-            _LOGGER.warning(
-                "Could not determine this host's LAN IP (got 0.0.0.0); the iPhone may not discover "
-                "the remote. Check that the network interface is up and the host has an IPv4 address."
-            )
 
         try:
             zconf = Zeroconf()
             stack.callback(zconf.close)
-            unpublish = await advertise_companion(
-                loop, zconf, local_ip, bound_port,
+            # The advertiser defers registration until a real LAN IPv4 exists and re-advertises if the
+            # IP later changes (DHCP renewal / interface flap), so the iPhone keeps discovering us.
+            advertiser = CompanionAdvertiser(
+                loop, zconf, port=bound_port,
                 device_name=config.companion.device_name,
                 model=config.companion.model,
+                detect_ip=lambda: _detect_local_ip(config.samsung.host),
             )
+            await advertiser.start()
         except OSError as exc:
             # Without mDNS the phone can't find us at all, so fail with guidance instead of a raw trace.
             raise RuntimeError(
@@ -146,7 +143,7 @@ async def run(config: Config) -> None:
                 "firewall, that the interface allows multicast, and (on segmented VLANs) that an mDNS "
                 "reflector forwards _companion-link._tcp from the phone's network to this host."
             ) from exc
-        stack.push_async_callback(unpublish)
+        stack.push_async_callback(advertiser.close)
 
         # The Apple side is now up, so the iPhone can discover + pair even if the TV is offline.
         # Surface what the operator should look for (never the PIN).

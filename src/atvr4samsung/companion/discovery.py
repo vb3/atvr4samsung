@@ -11,15 +11,21 @@ these mDNS TXT constants could likewise be made per-install in future.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from functools import partial
 from ipaddress import IPv4Address
-from typing import Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from zeroconf import ServiceInfo
 
 _LOGGER = logging.getLogger(__name__)
 
 Unpublisher = Callable[[], Awaitable[None]]
+
+# No usable IPv4 yet (interface down / awaiting DHCP). We never advertise this — it would make the
+# bridge undiscoverable — so registration is deferred until a real address appears.
+_NO_IP = "0.0.0.0"
 
 
 def companion_txt_records(*, model: str = "AppleTV14,1", **overrides: str) -> Dict[str, str]:
@@ -76,3 +82,118 @@ async def advertise_companion(
         await loop.run_in_executor(None, zconf.unregister_service, info)
 
     return _unregister
+
+
+SyncCaller = Callable[[Callable[[], Any]], Awaitable[Any]]
+
+
+class CompanionAdvertiser:
+    """Publishes the Companion service and keeps its advertised address current.
+
+    The advertised LAN IP was previously detected once at startup, so a DHCP lease change or interface
+    flap left a stale address and the iPhone could no longer discover/reach the bridge until a manual
+    restart. This advertiser instead:
+      * **defers** registration until a usable (non-0.0.0.0) IPv4 exists (advertising 0.0.0.0 makes us
+        undiscoverable),
+      * polls the local IP periodically and, on change, calls zeroconf ``update_service`` — which keeps
+        the existing registration live until the update succeeds (no discovery gap), and
+      * unregisters + stops the poller on close.
+
+    ``detect_ip`` returns the current best local IPv4 (``"0.0.0.0"`` if none). ``sleep`` and ``call``
+    are injectable so the poll loop and the (blocking) zeroconf calls are testable without real timing
+    or a real Zeroconf instance.
+    """
+
+    def __init__(
+        self,
+        loop,
+        zconf,
+        *,
+        port: int,
+        device_name: str,
+        detect_ip: Callable[[], str],
+        model: str = "AppleTV14,1",
+        properties: Optional[Dict[str, str]] = None,
+        poll_interval: float = 45.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        call: Optional[SyncCaller] = None,
+    ) -> None:
+        self._loop = loop
+        self._zconf = zconf
+        self._port = port
+        self._device_name = device_name
+        self._model = model
+        self._properties = properties or companion_txt_records(model=model)
+        self._poll_interval = poll_interval
+        self._detect_ip = detect_ip
+        self._sleep = sleep
+        # zeroconf register/update/unregister block, so run them off the event loop by default.
+        self._call: SyncCaller = call or (lambda fn: loop.run_in_executor(None, fn))
+        self._current_ip: Optional[str] = None
+        self._info: Optional[ServiceInfo] = None
+        self._registered = False
+        self._task: Optional[asyncio.Future] = None
+
+    def _build_info(self, address: str) -> ServiceInfo:
+        return ServiceInfo(
+            "_companion-link._tcp.local.",
+            f"{self._device_name}._companion-link._tcp.local.",
+            addresses=[IPv4Address(address).packed],
+            port=self._port,
+            properties=dict(self._properties),
+        )
+
+    async def refresh(self) -> None:
+        """Register (or re-advertise) if a usable IP appeared or changed; otherwise do nothing."""
+        ip = self._detect_ip()
+        if ip == _NO_IP or ip == self._current_ip:
+            return
+        info = self._build_info(ip)
+        if self._registered:
+            await self._call(partial(self._zconf.update_service, info))
+            _LOGGER.info("LAN IP changed -> re-advertised %r at %s:%s", self._device_name, ip, self._port)
+        else:
+            await self._call(partial(self._zconf.register_service, info))
+            self._registered = True
+            _LOGGER.info("Advertised _companion-link._tcp as %r at %s:%s", self._device_name, ip, self._port)
+        self._current_ip = ip
+        self._info = info
+
+    async def start(self) -> "CompanionAdvertiser":
+        """Do the initial registration (if an IP exists) and start the background refresh poller.
+
+        An initial registration failure (OSError) propagates so the caller can fail with guidance; a
+        missing IP just defers until the poller sees one.
+        """
+        await self.refresh()
+        if not self._registered:
+            _LOGGER.warning(
+                "No usable LAN IPv4 yet (got 0.0.0.0); deferring mDNS advertisement until an address "
+                "appears. The iPhone can't discover the remote until then — check the interface is up."
+            )
+        self._task = asyncio.ensure_future(self._poll_loop())
+        return self
+
+    async def _poll_loop(self) -> None:
+        while True:
+            await self._sleep(self._poll_interval)
+            try:
+                await self.refresh()
+            except Exception:
+                # Keep the current advertisement rather than crashing the service on a transient hiccup.
+                _LOGGER.exception("mDNS address refresh failed; keeping the current advertisement")
+
+    async def close(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self._registered and self._info is not None:
+            try:
+                await self._call(partial(self._zconf.unregister_service, self._info))
+            except Exception:
+                _LOGGER.debug("Ignoring error unregistering mDNS advertisement", exc_info=True)
+            self._registered = False
