@@ -448,7 +448,12 @@ def make_samsung_dispatch(client, toggle: Optional[PlayPauseToggle] = None) -> D
         elif command.action is Action.SEND_TEXT and command.text is not None:
             await client.send_text(command.text)
         elif command.action is Action.PLAY_PAUSE_TOGGLE:
-            await client.send_key(toggle.next_key())
+            key = toggle.peek_next_key()
+            await client.send_key(key)
+            # Commit the play/pause flip only after the send succeeds: if send_key raised (TV asleep /
+            # cooling down) we never reach here, so the toggle stays put and the next press retries the
+            # same key instead of silently inverting.
+            toggle.advance()
         elif command.action is Action.POWER_OFF:
             await client.power_off()
         elif command.action is Action.WAKE_ON_LAN:

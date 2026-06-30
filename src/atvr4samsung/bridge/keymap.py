@@ -135,12 +135,22 @@ class PlayPauseToggle:
     def playing(self) -> bool:
         return self._playing
 
+    def peek_next_key(self) -> str:
+        """The key the next press will send, WITHOUT advancing the toggle (commit via :meth:`advance`).
+
+        Lets the caller send to the TV first and flip state only on success, so a send that never
+        reached the TV (asleep/cooling down) can't invert play/pause and desync every later press.
+        """
+        return "KEY_PAUSE" if self._playing else "KEY_PLAY"
+
+    def advance(self) -> None:
+        """Flip play/pause state. Call only after the corresponding key was sent successfully."""
+        self._playing = not self._playing
+
     def next_key(self) -> str:
-        if self._playing:
-            self._playing = False
-            return "KEY_PAUSE"
-        self._playing = True
-        return "KEY_PLAY"
+        key = self.peek_next_key()
+        self.advance()
+        return key
 
     def set_playing(self, playing: bool) -> None:
         self._playing = playing
