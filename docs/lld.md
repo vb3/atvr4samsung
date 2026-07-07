@@ -69,7 +69,15 @@ overrides handlers to relay decoded commands. Notable overrides:
   connection on a ChaCha decrypt failure** so the client re-pairs.
 - `handle__hidc` — decode `{_hBtS, _hidC}` button frames; resolve via `bridge/keymap.resolve()` and
   dispatch. Acts on **release** (`_hBtS=2`); de-dupes a SELECT that double-fires within 400 ms (a
-  center tap arrives as both a discrete Select and a touch click).
+  center tap arrives as both a discrete Select and a touch click). The **Siri/mic button** (`_hidC` 10)
+  is acked with an empty response and ignored — a real Apple TV opens a voice-capture session we have
+  no audio path to relay; it's dropped from the pressed-button set so it can't wedge state. (Prior to
+  v0.8.2 it fell through to a per-tap `Unhandled command` warning with no ack.)
+- **Benign pushed events** — during a Control Center session iOS pushes `PublishPresenceEvent`,
+  `SwitchActiveUserAccountEvent` and `FetchUpNextInfoEvent` as fire-and-forget notifications. We ack
+  each with an empty success response (`handle_publishpresenceevent` etc.). The base loop otherwise
+  had no handler and replied with an RPError plus a warning on every push (~340/week); the phone
+  simply re-sent. An empty `FetchUpNextInfo` ack is truthful — nothing is playing.
 - `handle__hidt` / `handle__touchstart` — touch session. `_touchStart` **must** reply with a touch
   device id under `_c['_i']` (we send `{"_i": 1}`); an empty reply makes iOS fail the touch session
   (`RPErrorDomain -6762 "No touch device ID"`) and tear down the whole remote.
@@ -108,7 +116,7 @@ iPhone keyboard appears only when a TV text field is focused.
 | 12 | Sleep | `KEY_POWER` (off) | |
 | 13 | Wake | Wake-on-LAN packet | |
 | 15/16/17 | Channel ± / Guide | `KEY_CHUP`/`CHDOWN`/`GUIDE` | stretch (non-MVP) |
-| 10 | Siri | (unmapped) | no Samsung equivalent |
+| 10 | Siri | (ignored, acked empty) | no audio path to the Frame — see §3 note |
 
 > **Wire-code gotcha:** the TVRemoteCore decompile names Mute as `TVRCButton` **29** / Power as **30**,
 > but iOS 26's Control Center sends them over the wire as `_hidC` **18** (raw HID `PageUp`) and **19**
@@ -172,11 +180,20 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   `Decrypt failed`. The server **closes the connection**; iOS reconnects and re-runs pair-verify
   automatically. (We considered server-side TCP keepalive but a tcpdump of an idle real-ATV
   connection showed **no** server keepalives, so we don't add any — Rapport drives liveness.)
+- **Samsung-side idle drop:** the Frame closes its remote websocket when it sleeps, so the first key
+  after idle raises a connection-closed error; `SamsungFrameClient.send_key`/`send_text` reconnect
+  once and **re-send the same command**, so nothing is lost. That expected drop logs at **INFO**
+  (`_is_expected_socket_drop`: `ConnectionError`/`OSError`/timeout/`ConnectionClosed*`); an
+  *unexpected* exception type still logs at **WARNING** so a real fault isn't disguised as a routine
+  reconnect. If the retry also fails, the exception propagates to `_safe_dispatch` (exception-level).
 - **mDNS advertisement lifecycle (`discovery.py` `CompanionAdvertiser`):** the advertised LAN IPv4 is
   no longer detected once at startup. The advertiser **defers** registration until a usable
   (non-`0.0.0.0`) address exists, then **polls** the local IP (~45 s) and on change calls zeroconf
   `update_service` — which keeps the existing registration live until the update lands, so there's no
   discovery gap on a DHCP renewal / interface flap. It unregisters + stops the poller on shutdown.
+  (Shutdown closes the shared `Zeroconf` off the event loop via an executor — calling its blocking
+  `close()` on the loop thread only logged a cosmetic `unregister_all_services skipped as it does
+  blocking i/o` warning; the goodbye packet is already sent by the advertiser's unregister.)
 
 ## 7. Config & state
 

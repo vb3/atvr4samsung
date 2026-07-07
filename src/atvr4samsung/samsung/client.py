@@ -57,6 +57,20 @@ def _short_exception_repr(exc: BaseException, max_length: int = 120) -> str:
     return f"{value[: max_length - 1]}…"
 
 
+def _is_expected_socket_drop(exc: BaseException) -> bool:
+    """True if ``exc`` looks like the Frame TV closing an idle websocket.
+
+    That case is expected and self-heals (:meth:`send_key` reconnects and re-sends the same command),
+    so it belongs at INFO. Anything else (auth, library, or programming errors that merely happen to
+    recover on retry) stays at WARNING so real problems aren't disguised as routine reconnects.
+    """
+    if isinstance(exc, (ConnectionError, OSError, asyncio.TimeoutError, TimeoutError, EOFError)):
+        return True
+    # websockets raises ConnectionClosed / ConnectionClosedOK / ConnectionClosedError; match by name
+    # so the heavy library import can stay deferred out of this module's import path.
+    return "ConnectionClosed" in type(exc).__name__
+
+
 def connect_failure_hint(exc: BaseException) -> str:
     """Return an operator-facing hint for a Samsung TV connection failure."""
     details = f"{type(exc).__name__}: {exc}".lower()
@@ -263,7 +277,10 @@ class SamsungFrameClient:
         try:
             await self._remote.send_command(command)
         except Exception as exc:  # broad: samsungtvws raises various ws/connection errors
-            _LOGGER.warning("send_key(%s) failed (%s); reconnecting once", key, type(exc).__name__)
+            level = logging.INFO if _is_expected_socket_drop(exc) else logging.WARNING
+            _LOGGER.log(
+                level, "send_key(%s) socket dropped (%s); reconnecting once", key, type(exc).__name__
+            )
             await self.close()
             self._raise_if_connect_cooling_down()
             await self.connect()
@@ -300,7 +317,10 @@ class SamsungFrameClient:
             try:
                 await self._send_text_once(text)
             except Exception as exc:
-                _LOGGER.warning("send_text failed (%s); reconnecting once", type(exc).__name__)
+                level = logging.INFO if _is_expected_socket_drop(exc) else logging.WARNING
+                _LOGGER.log(
+                    level, "send_text socket dropped (%s); reconnecting once", type(exc).__name__
+                )
                 await self.close()  # also resets _first_text_sent so the new field re-broadcasts
                 self._raise_if_connect_cooling_down()
                 await self.connect()

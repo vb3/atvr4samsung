@@ -2,7 +2,11 @@
 import asyncio
 import unittest
 
-from atvr4samsung.samsung.client import SamsungFrameClient, connect_failure_hint
+from atvr4samsung.samsung.client import (
+    SamsungFrameClient,
+    _is_expected_socket_drop,
+    connect_failure_hint,
+)
 
 
 MAC = "aa:bb:cc:dd:ee:ff"
@@ -324,6 +328,30 @@ class TestSamsungTextInput(unittest.IsolatedAsyncioTestCase):
         # The new connection re-broadcasts text_received before the input string (flag reset on close).
         self.assertIsInstance(second.sent_commands[0], ChannelEmitCommand)
         self.assertEqual(type(second.sent_commands[1]).__name__, "SendInputString")
+
+
+class ExpectedSocketDropTests(unittest.TestCase):
+    """The idle-drop classifier decides INFO (routine reconnect) vs WARNING (real fault) in send_key."""
+
+    def test_connection_and_os_errors_are_expected(self):
+        for exc in (
+            ConnectionResetError(),
+            ConnectionError(),
+            OSError("broken pipe"),
+            asyncio.TimeoutError(),
+            EOFError(),
+        ):
+            self.assertTrue(_is_expected_socket_drop(exc), exc)
+
+    def test_websockets_connection_closed_matched_by_name(self):
+        class ConnectionClosedError(Exception):
+            pass
+
+        self.assertTrue(_is_expected_socket_drop(ConnectionClosedError()))
+
+    def test_unexpected_errors_stay_loud(self):
+        for exc in (RuntimeError("boom"), ValueError("bad"), KeyError("k")):
+            self.assertFalse(_is_expected_socket_drop(exc), exc)
 
 
 if __name__ == "__main__":

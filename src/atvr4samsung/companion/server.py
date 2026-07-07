@@ -182,6 +182,20 @@ class BridgeCompanionService(FakeCompanionService):
         """Report supported remote actions. Empty set is accepted by iOS; refine if needed."""
         self.send_response(message, {})
 
+    # iOS 26 pushes these fire-and-forget notifications during a Control Center session and expects a
+    # plain ack. The base loop has no handler for them, so it replied with an RPError (code 58822) and
+    # logged a WARNING on every push — ~340 warnings/week and the phone just re-sends. A real device
+    # either ignores them or acks empty; we ack empty. FetchUpNextInfo's empty {} == "nothing up next",
+    # which is true since nothing is playing on the emulated device.
+    def handle_publishpresenceevent(self, message):  # noqa: N802
+        self.send_response(message, {})
+
+    def handle_switchactiveuseraccountevent(self, message):  # noqa: N802
+        self.send_response(message, {})
+
+    def handle_fetchupnextinfoevent(self, message):  # noqa: N802
+        self.send_response(message, {})
+
     def handle_tvrcsessionstart(self, message):  # noqa: N802
         """Ack the TV Remote session, then proactively push media-control flags.
 

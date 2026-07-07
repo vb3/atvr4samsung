@@ -385,7 +385,15 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
         button_state = message["_c"]["_hBtS"]
         button_code = HidCommand(message["_c"]["_hidC"])
 
-        if button_state == 1:
+        if button_code == HidCommand.Siri:
+            # The Siri/mic button opens a voice-capture session on a real Apple TV; we have no audio
+            # path to the Frame TV, so there's nothing to relay. Ack it empty (fall through to
+            # send_response) and drop any stray press state so it can't wedge _pressed_buttons —
+            # iOS emits states 0/1/2 for this button. Previously every mic tap logged as an
+            # "Unhandled command" warning.
+            self._pressed_buttons.discard(button_code)
+            _LOGGER.debug("Siri button ignored — no voice relay to the Frame TV")
+        elif button_state == 1:
             _LOGGER.debug("Button %s pressed DOWN", button_code)
             self._pressed_buttons.add(button_code)
         elif button_state == 2 and button_code == HidCommand.Sleep:

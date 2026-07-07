@@ -126,7 +126,15 @@ async def run(config: Config) -> None:
 
         try:
             zconf = Zeroconf()
-            stack.callback(zconf.close)
+            # Close zeroconf OFF the event-loop thread on shutdown. zeroconf's own close() runs
+            # unregister_all_services, which does blocking multicast I/O; called on the loop thread it
+            # detects the running loop and logs "unregister_all_services skipped as it does blocking
+            # i/o" then skips it. (Harmless today — advertiser.close, registered after this so it
+            # unwinds first, already sent the goodbye packet — but the warning is pure noise.)
+            async def _close_zeroconf() -> None:
+                await loop.run_in_executor(None, zconf.close)
+
+            stack.push_async_callback(_close_zeroconf)
             # The advertiser defers registration until a real LAN IPv4 exists and re-advertises if the
             # IP later changes (DHCP renewal / interface flap), so the iPhone keeps discovering us.
             advertiser = CompanionAdvertiser(
