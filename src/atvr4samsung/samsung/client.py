@@ -227,6 +227,10 @@ class SamsungFrameClient:
             _LOGGER.warning("Samsung TV connection failed: %s", connect_failure_hint(exc))
             raise
         self._last_connect_failed = False
+        # Timing signal: a cold connect on the Frame's websocket costs ~1.5-2s, so this is what the
+        # first button press after an idle-drop pays for. Logged so a latency trace can attribute it.
+        # Reuse the attempt timestamp (no extra time_fn tick) so the failure path's cooldown math holds.
+        _LOGGER.info("Samsung TV connected in %.3fs", self._time_fn() - self._last_connect_attempt_at)
         return self
 
     async def _discard_remote(self) -> None:

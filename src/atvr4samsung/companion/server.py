@@ -73,6 +73,14 @@ class BridgeCompanionService(FakeCompanionService):
     Construct via :func:`serve`; one instance is created per client connection.
     """
 
+    # Per-connection latency instrumentation (class-level defaults so handlers stay safe on
+    # ``__new__``-built test instances that skip ``__init__``/``connection_made``). Timestamps are
+    # loop-monotonic seconds; the elapsed figures let a log trace attribute a slow "remote connect"
+    # to the Apple-side handshake vs. the lazy Samsung reconnect. See docs/lld.md §6.
+    _t_connect: Optional[float] = None
+    _conn_id: str = "----"
+    _first_command_logged: bool = False
+
     def __init__(
         self,
         state: FakeCompanionState,
@@ -209,6 +217,7 @@ class BridgeCompanionService(FakeCompanionService):
         super().handle_tvrcsessionstart(message)
         self.send_event("MediaControlStatus", message["_x"], {_MODERN_FLAGS_KEY: _MEDIA_FLAGS})
         self.send_event("_iMC", message["_x"], {_LEGACY_FLAGS_KEY: _MEDIA_FLAGS})
+        _LOGGER.info("[conn %s] TVRCSessionStart +%.3fs since TCP connect", self._conn_id, self._since_connect())
 
     def handle_fetchsiriremoteinfo(self, message):  # noqa: N802
         """Empty info satisfies iOS; volume is gated by MediaControlFlags, not Siri info."""
@@ -354,6 +363,20 @@ class BridgeCompanionService(FakeCompanionService):
         _LOGGER.debug("RTI text -> %d chars", len(text))
         self._dispatch_sink(Command(Action.SEND_TEXT, text=text, source="rti"))
 
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        self._t_connect = self.loop.time()
+        self._first_command_logged = False
+        self._conn_id = f"{id(transport) & 0xffff:04x}"
+        peer = transport.get_extra_info("peername")
+        # peer is the phone (or the mDNS reflector's forwarded source) — a LAN IP, useful for spotting
+        # a cross-VLAN path; no secret. This is the T0 for the per-connection latency trace.
+        _LOGGER.info("[conn %s] TCP connected from %s", self._conn_id, peer[0] if peer else "?")
+
+    def _since_connect(self) -> float:
+        """Seconds since this client's TCP connection was accepted (-1 if unknown)."""
+        return self.loop.time() - self._t_connect if self._t_connect is not None else -1.0
+
     def connection_lost(self, exc):
         # Base clears transport + state.clients but not rti_clients; drop our registration so a stale
         # connection can't keep receiving focus pushes.
@@ -416,6 +439,14 @@ class BridgeCompanionService(FakeCompanionService):
             _LOGGER.debug("Relay text (%s)", command.source)
         else:
             _LOGGER.info("Relay %s (%s)", command.action.value, command.source)
+        # First command of a connection: log elapsed-since-connect (T3). Combined with the Samsung
+        # client's own "connected in N.NNNs", this shows whether the first press ate a cold reconnect.
+        if not self._first_command_logged:
+            self._first_command_logged = True
+            _LOGGER.info(
+                "[conn %s] first command +%.3fs since TCP connect (%s)",
+                self._conn_id, self._since_connect(), command.action.value,
+            )
         if self._dispatch is None:
             return
         self.loop.create_task(self._safe_dispatch(command))

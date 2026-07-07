@@ -186,6 +186,12 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   (`_is_expected_socket_drop`: `ConnectionError`/`OSError`/timeout/`ConnectionClosed*`); an
   *unexpected* exception type still logs at **WARNING** so a real fault isn't disguised as a routine
   reconnect. If the retry also fails, the exception propagates to `_safe_dispatch` (exception-level).
+- **Connection latency trace (INFO):** each client connection logs `[conn <id>] TCP connected` (T0),
+  `[conn <id>] TVRCSessionStart +Xs` (remote opened), and `[conn <id>] first command +Xs`; the
+  Samsung client logs `Samsung TV connected in Xs`. Together with `Pair-verify OK` these attribute a
+  slow "remote connect" to the Apple-side handshake vs. a cold Samsung reconnect (~1.5-2s). What they
+  **can't** see is cross-VLAN mDNS discovery + TCP setup, which happens before T0 — measure that with
+  a `tcpdump` of `udp port 5353` + the Companion TCP port if the handshake trace looks fast.
 - **mDNS advertisement lifecycle (`discovery.py` `CompanionAdvertiser`):** the advertised LAN IPv4 is
   no longer detected once at startup. The advertiser **defers** registration until a usable
   (non-`0.0.0.0`) address exists, then **polls** the local IP (~45 s) and on change calls zeroconf
