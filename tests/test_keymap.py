@@ -3,8 +3,10 @@ import unittest
 
 from atvr4samsung.bridge.keymap import (
     GESTURE_TO_SAMSUNG,
+    REPEATABLE_BUTTONS,
     Action,
     AppleButton,
+    is_repeatable,
     resolve,
 )
 
@@ -88,6 +90,26 @@ class TestKeymapResolution(unittest.TestCase):
                 self.assertTrue(mapping.samsung_key.startswith("KEY_"), button)
             elif mapping.action in (Action.WAKE_ON_LAN, Action.UNMAPPED):
                 self.assertIsNone(mapping.samsung_key, f"{button} should carry no raw key")
+
+
+class TestRepeatableButtons(unittest.TestCase):
+    def test_only_volume_is_repeatable(self):
+        self.assertTrue(is_repeatable(int(AppleButton.VolumeUp)))
+        self.assertTrue(is_repeatable(int(AppleButton.VolumeDown)))
+        for button in (
+            AppleButton.Up, AppleButton.Select, AppleButton.Home, AppleButton.PlayPause,
+            AppleButton.Mute, AppleButton.Power, AppleButton.ChannelIncrement,
+        ):
+            self.assertFalse(is_repeatable(int(button)), button)
+
+    def test_unknown_codes_are_not_repeatable(self):
+        for code in (0, 29, 30, 9999, -1):
+            self.assertFalse(is_repeatable(code), code)
+
+    def test_repeatable_set_is_exactly_volume(self):
+        self.assertEqual(
+            REPEATABLE_BUTTONS, frozenset({AppleButton.VolumeUp, AppleButton.VolumeDown})
+        )
 
 
 class TestGestureSamsungMap(unittest.TestCase):

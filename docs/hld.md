@@ -39,7 +39,7 @@ WebSocket API.
 
 | Component | Responsibility | Code |
 |---|---|---|
-| **Companion server** | Emulated Apple TV: mDNS advertise, pairing (SRP-6a + Curve25519), encrypted session, decode `_hidC` buttons + `_hidT` touch/swipe + media-control frames. | `companion/server.py`, `companion/protocol/`, `companion/discovery.py` |
+| **Companion server** | Emulated Apple TV: mDNS advertise, pairing (SRP-6a + Curve25519), encrypted session, decode `_hidC` buttons + `_hidT` touch/swipe + media-control frames; relay decisions + volume hold-to-repeat. | `companion/server.py`, `companion/relay.py`, `companion/repeater.py`, `companion/protocol/`, `companion/discovery.py` |
 | **Command mapper** | Pure decision logic: Apple button → Samsung `KEY_*`; swipe → discrete direction; play/pause toggle. No I/O, fully unit-tested. | `bridge/keymap.py`, `bridge/gestures.py` |
 | **Samsung client** | Async WebSocket control (Tizen `KEY_*`), token persistence, Wake-on-LAN magic packet. | `samsung/client.py` |
 | **App / service** | Wire the above together, load config, advertise, run under systemd. | `app.py`, `config.py` |
@@ -103,8 +103,9 @@ Update [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) whenever depende
 ## 9. Status & roadmap
 
 - **Working:** discovery, pair-once + signature verification, encrypted session, D-pad/Select/Menu/
-  Home, swipes, Play/Pause toggle, **Volume Up/Down + Mute**, **Power**, **keyboard text entry into the
-  TV's system fields** (search/browser via the Tizen IME), auto-reconnect on stale session.
+  Home, swipes, Play/Pause toggle, **Volume Up/Down (hold-to-repeat) + Mute**, **Power**, **keyboard
+  text entry into the TV's system fields** (search/browser via the Tizen IME), auto-reconnect on stale
+  session.
 - **Known limits:** Wake-on-LAN is unreliable on 2021+ Frames (magic packet often ignored even with
   "Power On with Mobile" on) — see `operations.md`. Keyboard input works only in apps that use the TV's
   **system IME**; apps with their own keyboard (YouTube, Netflix) emit no IME events and ignore it.

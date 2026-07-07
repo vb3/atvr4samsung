@@ -140,6 +140,7 @@ class SamsungFrameClient:
         self._on_ime_event = on_ime_event
         self._first_text_sent = False  # some TVs need a text_received broadcast before the first insert
         self._text_lock = asyncio.Lock()  # serialize rapid keystroke sends so the field stays ordered
+        self._send_lock = asyncio.Lock()  # serialize key sends + reconnect on the one shared websocket
         self._last_connect_attempt_at: Optional[float] = None
         self._last_connect_failed = False
 
@@ -269,27 +270,35 @@ class SamsungFrameClient:
             f"TV still unreachable (cooling down {remaining:.1f} s); try again shortly"
         )
 
-    async def send_key(self, key: str, cmd: str = "Click") -> None:
+    async def send_key(self, key: str, cmd: str = "Click", key_press_delay: Optional[float] = None) -> None:
         """Send a Tizen ``KEY_*`` to the TV.
 
         ``cmd`` is ``"Click"`` (default, a tap), ``"Press"`` (key-down) or ``"Release"`` (key-up) for
         press-and-hold semantics. Reconnects once and retries if the socket has dropped.
+
+        ``key_press_delay`` overrides samsungtvws' post-send pacing for this call (``None`` keeps the
+        instance default of :attr:`key_press_delay`). Volume auto-repeat passes ``0`` so the repeater's
+        own cadence — not the library's ~0.25s sleep — controls the repeat rate.
         """
         self._validate_key_cmd(cmd)
-        await self._ensure_connected()
-        command = self._build_key_command(key, cmd)
-        try:
-            await self._remote.send_command(command)
-        except Exception as exc:  # broad: samsungtvws raises various ws/connection errors
-            level = logging.INFO if _is_expected_socket_drop(exc) else logging.WARNING
-            _LOGGER.log(
-                level, "send_key(%s) socket dropped (%s); reconnecting once", key, type(exc).__name__
-            )
-            await self.close()
-            self._raise_if_connect_cooling_down()
-            await self.connect()
-            await self._remote.send_command(command)
-        _LOGGER.debug("Sent %s %s", cmd, key)
+        # Serialize key sends (and their one-shot reconnect) so concurrent presses — e.g. a volume
+        # auto-repeat overlapping another button — can't interleave on the single shared websocket.
+        async with self._send_lock:
+            await self._ensure_connected()
+            command = self._build_key_command(key, cmd)
+            send_kwargs = {} if key_press_delay is None else {"key_press_delay": key_press_delay}
+            try:
+                await self._remote.send_command(command, **send_kwargs)
+            except Exception as exc:  # broad: samsungtvws raises various ws/connection errors
+                level = logging.INFO if _is_expected_socket_drop(exc) else logging.WARNING
+                _LOGGER.log(
+                    level, "send_key(%s) socket dropped (%s); reconnecting once", key, type(exc).__name__
+                )
+                await self.close()
+                self._raise_if_connect_cooling_down()
+                await self.connect()
+                await self._remote.send_command(command, **send_kwargs)
+            _LOGGER.debug("Sent %s %s", cmd, key)
 
     async def hold_key(self, key: str, seconds: float = 1.0) -> None:
         """Press and hold a key for ``seconds`` (used for press-repeat semantics)."""

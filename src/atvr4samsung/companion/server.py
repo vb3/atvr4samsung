@@ -30,7 +30,8 @@ from .protocol.appletv import (
 
 from ..bridge.gestures import TOUCH_ACTION_NAMES, GestureConfig
 from ..bridge.keymap import Action
-from .relay import Command, CommandRelay, volume_key_for
+from .relay import Command, CommandRelay, RepeatPhase, volume_key_for
+from .repeater import VolumeRepeater
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,6 +111,14 @@ class BridgeCompanionService(FakeCompanionService):
         self._pressed_buttons = set()
         self._dispatch = dispatch
         self._relay = CommandRelay(self._dispatch_sink, gesture_config=gesture_config)
+        # Owns the hold-repeat timer/state for volume; the relay stays stateless (see repeater.py).
+        self._repeater = VolumeRepeater(self._send_repeat_key, loop=self.loop)
+
+    async def _send_repeat_key(self, key: str) -> None:
+        """Send one auto-repeat volume click (fast pacing; the repeater controls cadence)."""
+        if self._dispatch is None:
+            return
+        await self._dispatch(Command(Action.SEND_KEY, key, source="repeat", fast=True))
 
     # -- robustness: never let one bad frame drop a live session --------------
 
@@ -235,6 +244,7 @@ class BridgeCompanionService(FakeCompanionService):
 
     def handle_tvrcsessionstop(self, message):  # noqa: N802
         """Acknowledge the client closing its TV Remote session (tidy teardown)."""
+        self.loop.create_task(self._repeater.stop_all())
         self.send_response(message, {})
 
     def handle_mediacontrolcommand(self, message):  # noqa: N802
@@ -262,8 +272,13 @@ class BridgeCompanionService(FakeCompanionService):
             # last level and relay a discrete Samsung step; mirror the level so the slider stays live.
             new = content.get("_vol")
             if isinstance(new, (int, float)):
-                key, self.state.volume = volume_key_for(self.state.volume, new)
-                self._relay.emit(Command(Action.SEND_KEY, key, source="mcc:SetVolume"))
+                if self._repeater.volume_hold_active:
+                    # A HID volume hold is the authoritative source right now; drop the slider path so
+                    # we don't double-step. (The two shouldn't normally co-occur; guard is defensive.)
+                    _LOGGER.debug("Ignoring SetVolume while a volume hold is active")
+                else:
+                    key, self.state.volume = volume_key_for(self.state.volume, new)
+                    self._relay.emit(Command(Action.SEND_KEY, key, source="mcc:SetVolume"))
         elif cmd is MediaControlCommand.GetCaptionSettings:
             # iOS issues GetCaptionSettings during session setup and tears the TV Remote session
             # down ~2-4ms after our reply. An empty dict appears to be rejected; the caption-enabled
@@ -378,6 +393,8 @@ class BridgeCompanionService(FakeCompanionService):
         return self.loop.time() - self._t_connect if self._t_connect is not None else -1.0
 
     def connection_lost(self, exc):
+        # Stop any in-flight volume repeat so a mid-hold disconnect can't leave the TV volume running.
+        self.loop.create_task(self._repeater.stop_all())
         # Base clears transport + state.clients but not rti_clients; drop our registration so a stale
         # connection can't keep receiving focus pushes.
         try:
@@ -434,6 +451,24 @@ class BridgeCompanionService(FakeCompanionService):
         The relay is synchronous (it runs inside a protocol handler); fire the dispatch as a task so
         a slow Samsung call can't block the Companion frame loop.
         """
+        # Hold-repeat control (volume). Registered synchronously here, in frame order, so a release
+        # (STOP) can never race ahead of its press (START). START also fires one guaranteed immediate
+        # click as an independent task (never cancelled), so a fast tap always yields exactly one step
+        # while the repeater drives only the delayed repeats.
+        if command.repeat is RepeatPhase.START:
+            _LOGGER.info("Relay volume hold START (%s)", command.source)
+            key = command.samsung_key
+            if key is not None:
+                if self._dispatch is not None:
+                    self.loop.create_task(self._safe_dispatch(
+                        Command(command.action, key, source=command.source, fast=True)))
+                self._repeater.start(key)
+            return
+        if command.repeat is RepeatPhase.STOP:
+            _LOGGER.info("Relay volume hold STOP (%s)", command.source)
+            if command.samsung_key is not None:
+                self._repeater.stop(command.samsung_key)
+            return
         # Text fires per keystroke — keep it at DEBUG so typing doesn't flood the log.
         if command.action is Action.SEND_TEXT:
             _LOGGER.debug("Relay text (%s)", command.source)
@@ -487,7 +522,10 @@ def make_samsung_dispatch(client) -> Dispatch:
     """
     async def dispatch(command: Command) -> None:
         if command.action is Action.SEND_KEY and command.samsung_key:
-            await client.send_key(command.samsung_key, command.cmd)
+            # Auto-repeat/first-click volume sends set fast=True so the library's post-send pacing
+            # doesn't stack up; the repeater's own interval controls cadence.
+            key_press_delay = 0.0 if command.fast else None
+            await client.send_key(command.samsung_key, command.cmd, key_press_delay=key_press_delay)
         elif command.action is Action.SEND_TEXT and command.text is not None:
             await client.send_text(command.text)
         elif command.action is Action.POWER_OFF:

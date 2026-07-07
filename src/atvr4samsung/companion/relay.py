@@ -10,20 +10,30 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Optional, Tuple
 
 from ..bridge.gestures import GestureConfig, SwipeTranslator
-from ..bridge.keymap import GESTURE_TO_SAMSUNG, Action, resolve
+from ..bridge.keymap import GESTURE_TO_SAMSUNG, Action, is_repeatable, resolve
 
 _LOGGER = logging.getLogger(__name__)
 
-# Companion button-state values (``_hBtS``): 1 = down/press, 2 = up/release. We act on release.
+# Companion button-state values (``_hBtS``): 1 = down/press, 2 = up/release. Most buttons act on
+# release; repeatable buttons (volume) act on both edges to drive the hold-repeat lifecycle.
+_BUTTON_PRESS = 1
 _BUTTON_RELEASE = 2
 
 # A center tap arrives as BOTH a discrete Select button (``_hidC`` 6) and a touch tap that resolves to
 # SELECT — two KEY_ENTERs for one tap. Collapse a SELECT landing within this window of the previous
 # one. Well under a real double-click, so intentional repeats still pass.
 _SELECT_DEDUPE_MS = 400.0
+
+
+class RepeatPhase(Enum):
+    """Hold lifecycle for a repeatable button (see :func:`bridge.keymap.is_repeatable`)."""
+
+    START = "start"  # button went down — begin the immediate step + auto-repeat
+    STOP = "stop"    # button came up — stop repeating (no key is sent for this phase)
 
 
 @dataclass
@@ -35,6 +45,8 @@ class Command:
     cmd: str = "Click"  # Click / Press / Release
     source: str = ""  # debug provenance, e.g. "button:6" or "gesture:RIGHT"
     text: Optional[str] = None  # full field contents for Action.SEND_TEXT
+    repeat: Optional[RepeatPhase] = None  # hold lifecycle for repeatable buttons (volume)
+    fast: bool = False  # bypass the client's post-send pacing so the repeater controls cadence
 
 
 def volume_key_for(prev_volume_pct: float, new_level: float) -> Tuple[str, float]:
@@ -71,7 +83,22 @@ class CommandRelay:
         self._last_select_ms = 0.0
 
     def on_button(self, hid_code: int, button_state: int) -> None:
-        """Resolve a ``_hidC`` button and emit it — on release, to match a discrete click."""
+        """Resolve a ``_hidC`` button and emit it.
+
+        Non-repeatable buttons fire once on **release** (matches a discrete click). Repeatable
+        buttons (volume) emit a hold ``START`` on press and ``STOP`` on release; the async repeater
+        turns that into the immediate step plus auto-repeat. Repeatable buttons are always mapped, so
+        there's no ``UNMAPPED`` case to guard on that path.
+        """
+        if is_repeatable(hid_code):
+            mapping = resolve(hid_code)
+            if button_state == _BUTTON_PRESS:
+                self.emit(Command(mapping.action, mapping.samsung_key,
+                                  source=f"button:{hid_code}", repeat=RepeatPhase.START, fast=True))
+            elif button_state == _BUTTON_RELEASE:
+                self.emit(Command(mapping.action, mapping.samsung_key,
+                                  source=f"button:{hid_code}", repeat=RepeatPhase.STOP))
+            return
         if button_state != _BUTTON_RELEASE:
             return
         mapping = resolve(hid_code)

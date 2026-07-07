@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.9.0] - 2026-07-06
+
+### Added
+
+- **Hold-to-repeat volume.** Holding Volume Up/Down on the iPhone now keeps stepping the Frame TV's
+  volume, keyboard-style, instead of a single step per press: an immediate step, then a short delay
+  (~0.35 s) and steady repeats (~0.18 s) until release, hard-capped at 10 s. The relay stays stateless
+  — a new async `VolumeRepeater` (`companion/repeater.py`) owns the only timer and all hold state, and
+  the immediate first click is dispatched independently so a quick tap still sends exactly one step.
+  Fails closed: a lost release, a send error, or a disconnect stops the repeat; only one direction
+  repeats at a time; the SetVolume slider path is suppressed while a hold is active. Cadence is
+  code-level constants (`VolumeRepeatConfig`), not `config.yaml`.
+
+### Changed
+
+- `SamsungFrameClient.send_key` accepts a per-call `key_press_delay` override and serializes all key
+  sends (and their one-shot reconnect) behind a lock, so a volume repeat can't interleave with another
+  button on the single shared websocket. Repeat/first-click sends use `key_press_delay=0` so the
+  repeater's own cadence — not samsungtvws' post-send pacing — sets the rate.
+
 ## [0.8.0] - 2026-06-30
 
 A reliability/resiliency pass (Phase 1 of a performance/reliability sweep), plus a play/pause fix —

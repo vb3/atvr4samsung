@@ -18,6 +18,7 @@ class FakeRemote:
         self.started = 0
         self.closed = False
         self.sent_commands = []
+        self.send_delays = []  # key_press_delay passed per send_command
 
     async def start_listening(self, callback=None):
         self.started += 1
@@ -27,9 +28,30 @@ class FakeRemote:
 
     async def send_command(self, command, key_press_delay=None):
         self.sent_commands.append(command)
+        self.send_delays.append(key_press_delay)
         if self.send_failures:
             self.send_failures -= 1
             raise RuntimeError("send failed")
+
+
+class OrderRecordingRemote:
+    """Records send start/end markers around an await so a test can detect interleaving."""
+
+    def __init__(self, log):
+        self.log = log
+        self.started = 0
+        self.closed = False
+
+    async def start_listening(self, callback=None):
+        self.started += 1
+
+    async def close(self):
+        self.closed = True
+
+    async def send_command(self, command, key_press_delay=None):
+        self.log.append(("start", command.key))
+        await asyncio.sleep(0.01)  # yield so an unserialized second send could interleave here
+        self.log.append(("end", command.key))
 
 
 class FailingStartRemote:
@@ -80,6 +102,37 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([command.cmd for command in remote.sent_commands], ["Click"])
         self.assertEqual(remote.started, 1)
         self.assertEqual(len(factory.calls), 1)
+
+    async def test_send_key_default_leaves_pacing_to_the_library(self):
+        remote = FakeRemote()
+        client = make_client(FakeRemoteFactory(remote))
+
+        await client.send_key("KEY_HOME")
+
+        # No override passed -> None -> samsungtvws applies its configured key_press_delay.
+        self.assertEqual(remote.send_delays, [None])
+
+    async def test_send_key_forwards_fast_pacing_override(self):
+        remote = FakeRemote()
+        client = make_client(FakeRemoteFactory(remote))
+
+        await client.send_key("KEY_VOLUP", key_press_delay=0.0)
+
+        self.assertEqual(remote.send_delays, [0.0])
+
+    async def test_send_key_serializes_overlapping_sends(self):
+        # A volume auto-repeat overlapping another button must not interleave on the shared socket.
+        log = []
+        client = make_client(FakeRemoteFactory(OrderRecordingRemote(log)))
+
+        await asyncio.gather(client.send_key("KEY_VOLUP"), client.send_key("KEY_HOME"))
+
+        self.assertEqual(len(log), 4)
+        # Each send's start/end are adjacent (no start,start,end,end interleave).
+        self.assertEqual(log[0][0], "start")
+        self.assertEqual(log[1], ("end", log[0][1]))
+        self.assertEqual(log[2][0], "start")
+        self.assertEqual(log[3], ("end", log[2][1]))
 
     async def test_send_key_reconnects_once_and_succeeds(self):
         first_remote = FakeRemote(send_failures=1)
