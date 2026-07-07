@@ -200,6 +200,13 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   (Shutdown closes the shared `Zeroconf` off the event loop via an executor — calling its blocking
   `close()` on the loop thread only logged a cosmetic `unregister_all_services skipped as it does
   blocking i/o` warning; the goodbye packet is already sent by the advertiser's unregister.)
+- **mDNS TTLs:** the A-record (host) TTL is raised to `_HOST_TTL_SECONDS` (4500s, matching the
+  SRV/TXT/PTR default) instead of zeroconf's 120s. A packet capture showed the Pi answers a
+  `_companion-link` query in ~75 ms and completes TCP in ~85 µs, so the "few seconds to connect" is
+  the **cross-VLAN mDNS reflector** re-resolving us — which only happens once the phone's cache
+  expires. A long host TTL keeps the phone's cache warm ~75 min, making that slow path rare.
+  **Assumes a stable/reserved Pi IP** (a changed IP is otherwise cached stale for up to the TTL; the
+  advertiser re-announces with cache-flush on change, but reflectors may not propagate it).
 
 ## 7. Config & state
 

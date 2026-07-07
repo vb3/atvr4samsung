@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from atvr4samsung.companion.discovery import CompanionAdvertiser
+from atvr4samsung.companion.discovery import CompanionAdvertiser, _HOST_TTL_SECONDS
 
 
 class _FakeZeroconf:
@@ -56,6 +56,18 @@ class TestCompanionAdvertiser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(zc.registered), 1)
         self.assertEqual(_addr(zc.registered[0]), "192.0.2.5")
         self.assertEqual(zc.updated, [])
+
+    async def test_registered_info_uses_a_long_host_ttl(self):
+        # The A-record TTL must be raised well above zeroconf's 120s default so the iPhone caches our
+        # address across the cross-VLAN mDNS reflector instead of paying a slow re-resolve every ~2min.
+        zc = _FakeZeroconf()
+        adv = _make(zc, lambda: "192.0.2.5")
+
+        await adv.refresh()
+
+        self.assertEqual(len(zc.registered), 1)
+        self.assertEqual(zc.registered[0].host_ttl, _HOST_TTL_SECONDS)
+        self.assertGreater(_HOST_TTL_SECONDS, 120)
 
     async def test_defers_until_a_valid_ip_appears(self):
         zc = _FakeZeroconf()

@@ -27,6 +27,17 @@ Unpublisher = Callable[[], Awaitable[None]]
 # bridge undiscoverable — so registration is deferred until a real address appears.
 _NO_IP = "0.0.0.0"
 
+# A-record (host) TTL. zeroconf defaults this to 120s, which forces a resolver to re-query our IP
+# every ~2 min. When discovery crosses a VLAN mDNS reflector, that re-resolve is the slow part: a
+# packet capture showed the Pi answers in ~75 ms and completes TCP in ~85 µs, but the reflected
+# round-trip back to the phone's VLAN adds seconds — so the iPhone "takes a few seconds to connect"
+# only when its cache has expired. Matching the SRV/TXT/PTR default (4500s ≈ 75 min) lets the phone
+# cache our address far longer, cutting those slow cross-VLAN re-resolves to a rare event.
+# Requires a stable IP (DHCP reservation): a changed IP would otherwise be cached stale for up to
+# this long. The advertiser re-announces with cache-flush on an IP change, but reflectors don't
+# always propagate that — so pin the Pi's IP. See docs/lld.md §6.
+_HOST_TTL_SECONDS = 4500
+
 
 def companion_txt_records(*, model: str = "AppleTV14,1", **overrides: str) -> Dict[str, str]:
     """Build the Companion TXT record set. Override any field via kwargs."""
@@ -74,6 +85,7 @@ async def advertise_companion(
         addresses=[IPv4Address(address).packed],
         port=port,
         properties=dict(props),
+        host_ttl=_HOST_TTL_SECONDS,
     )
     await loop.run_in_executor(None, zconf.register_service, info)
 
@@ -142,6 +154,7 @@ class CompanionAdvertiser:
             addresses=[IPv4Address(address).packed],
             port=self._port,
             properties=dict(self._properties),
+            host_ttl=_HOST_TTL_SECONDS,
         )
         # zeroconf's register_service backfills the `server` (A-record host) but update_service does
         # NOT — it asserts "ServiceInfo must have a server". Set it now (the same value register
