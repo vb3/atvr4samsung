@@ -150,6 +150,12 @@ Published Release wheels are the `X.Y.0` stable cuts; patch bumps are not publis
 `SOURCE=git+https://github.com/vb3/atvr4samsung` or a clone (`SOURCE=.`) if you intentionally
 want latest `main`.
 
+Only the **3 newest releases** are kept: after each publish, the release workflow prunes older
+releases together with their git tags (`gh release delete --cleanup-tag`), so `releases/latest`
+always resolves and the tag list stays short. Which tags to drop is decided by the pure,
+unit-tested `scripts/prune_tags.py` (keep count = 3). If you need an old wheel, rebuild from that
+version's commit rather than expecting a stale release to linger.
+
 `config.yaml` and the state dir are untouched by an upgrade. If the service is slow to stop on
 restart (the asyncio server can take a few seconds on SIGTERM), that's expected.
 

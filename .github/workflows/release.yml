@@ -123,3 +123,35 @@ jobs:
           else
             gh release create "$TAG" dist/* --title "$TAG" --generate-notes --target "$GITHUB_SHA"
           fi
+
+  # Keep only the 3 newest release tags: after publishing, delete each older release together with
+  # its git tag (--cleanup-tag). Which tags to prune is decided by scripts/prune_tags.py (pure +
+  # unit-tested) so the destructive step never guesses. Runs only when a release was just made.
+  prune:
+    needs: [detect, release]
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prune old releases and tags (keep newest 3)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Authoritative list of releases (each has a matching git tag). Decide what to drop.
+          gh release list --limit 200 --json tagName --jq '.[].tagName' > tags.txt
+          echo "---- current release tags ----"; cat tags.txt
+          STALE="$(python scripts/prune_tags.py 3 < tags.txt)"
+          if [ -z "$STALE" ]; then
+            echo "Nothing to prune — 3 or fewer releases."
+            exit 0
+          fi
+          echo "---- pruning ----"; echo "$STALE"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Deleting release + tag: $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done <<< "$STALE"
