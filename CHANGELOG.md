@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.10.0] - 2026-07-07
+
+### Added
+
+- **Swipe-and-hold to auto-repeat (directional scroll).** Holding a directional swipe (LEFT/RIGHT/
+  UP/DOWN) past a ~400 ms dwell now keeps stepping that direction, keyboard-style (immediate step,
+  then ~0.25 s and steady ~0.12 s repeats), until you lift, reverse, or return toward center — handy
+  for scrubbing a timeline. A quick swipe is unchanged. Reuses the generalized hold driver; the held
+  gesture's discrete swipe/tap is suppressed so it can't double-fire.
+
+### Changed
+
+- **Generalized the hold-repeat driver:** `VolumeRepeater` → `HoldRepeater`, `VolumeRepeatConfig` →
+  `HoldRepeatConfig` (+ an optional `should_continue` liveness gate). Volume and directional holds each
+  get their own instance/cadence; START/STOP route by `Command.repeat_kind`.
+- **Swipe tuning (validated on-device):** `repeat_every`=350 so a deliberate swipe = 1 step while a
+  fast flick scrolls ~3 (iOS sends a flick as two momentum segments); `key_press_delay`=0.05 s so a
+  rapid burst of discrete swipes drains smoothly.
+
+### Fixed
+
+- Directional hold has **no frame-based dead-man** — iOS sends no touch frames for a held-but-still
+  finger (>1.2 s gaps), which cut real holds short in early testing. Stopped instead by touch `release`
+  (fails closed on a malformed frame), `_touchStop` (touch session ended without a release), and
+  teardown, with a 15 s `max_hold` runaway cap.
+
+### Note
+
+- **Volume hold-to-repeat is effectively inert:** iOS doesn't stream hold frames for the CC volume
+  buttons (press+release arrive together regardless of hold), so the volume repeat never registers. The
+  wiring is retained (generic, harmless); the working hold path is the touch-based directional swipe.
+
 ## [0.9.0] - 2026-07-06
 
 ### Added

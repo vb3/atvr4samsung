@@ -30,10 +30,31 @@ _SELECT_DEDUPE_MS = 400.0
 
 
 class RepeatPhase(Enum):
-    """Hold lifecycle for a repeatable button (see :func:`bridge.keymap.is_repeatable`)."""
+    """Hold lifecycle for a repeatable input (volume button or a held directional swipe)."""
 
-    START = "start"  # button went down — begin the immediate step + auto-repeat
-    STOP = "stop"    # button came up — stop repeating (no key is sent for this phase)
+    START = "start"  # hold began — begin the immediate step + auto-repeat
+    STOP = "stop"    # hold ended — stop repeating (no key is sent for this phase)
+
+
+# repeat_kind values: which hold driver a START/STOP belongs to (they have independent cadence/state).
+REPEAT_KIND_VOLUME = "volume"
+REPEAT_KIND_GESTURE = "gesture"
+
+
+@dataclass(frozen=True)
+class DirectionalHoldConfig:
+    """Tuning for swipe-and-hold auto-repeat (directional scroll). ``enabled`` gates the whole feature
+    (default off keeps the discrete-swipe behavior byte-identical). ``activate_ms`` is the dwell a
+    finger must stay past the swipe threshold in one direction before a swipe becomes a hold — long
+    enough that a normal quick swipe never trips it. The cadence/cap drive the async
+    :class:`~atvr4samsung.companion.repeater.HoldRepeater` in the server; the repeat is stopped by the
+    touch release (reliable on the live TCP link) with ``max_hold`` as the sole runaway backstop."""
+
+    enabled: bool = False
+    activate_ms: float = 400.0       # dwell before a held swipe starts repeating
+    initial_delay: float = 0.25      # repeater: delay after the immediate step before repeats begin
+    interval: float = 0.12           # repeater: delay between repeats while held
+    max_hold: float = 15.0           # repeater: hard safety cap (final runaway backstop; see server)
 
 
 @dataclass
@@ -45,7 +66,8 @@ class Command:
     cmd: str = "Click"  # Click / Press / Release
     source: str = ""  # debug provenance, e.g. "button:6" or "gesture:RIGHT"
     text: Optional[str] = None  # full field contents for Action.SEND_TEXT
-    repeat: Optional[RepeatPhase] = None  # hold lifecycle for repeatable buttons (volume)
+    repeat: Optional[RepeatPhase] = None  # hold lifecycle (volume button / held directional swipe)
+    repeat_kind: Optional[str] = None  # REPEAT_KIND_* — which hold driver this START/STOP routes to
     fast: bool = False  # bypass the client's post-send pacing so the repeater controls cadence
 
 
@@ -73,14 +95,22 @@ class CommandRelay:
         sink: Callable[[Command], None],
         *,
         gesture_config: Optional[GestureConfig] = None,
+        hold_config: Optional[DirectionalHoldConfig] = None,
         select_dedupe_ms: float = _SELECT_DEDUPE_MS,
         clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
         self._sink = sink
         self._swipe = SwipeTranslator(gesture_config)
+        self._hold_config = hold_config or DirectionalHoldConfig()
         self._select_dedupe_ms = select_dedupe_ms
         self._clock_ms = clock_ms or (lambda: time.monotonic() * 1000.0)
         self._last_select_ms = 0.0
+        # Swipe-and-hold state (directional auto-repeat). Only used when hold_config.enabled.
+        self._hold_dir: Optional[str] = None       # candidate direction currently dwelling
+        self._hold_since_ms: float = 0.0           # when the candidate direction started
+        self._hold_active = False                  # a repeat is currently running for _hold_dir
+        self._hold_was_active = False              # a hold activated at some point this gesture
+        self._suppress_click_until_press = False   # drop a stray SELECT after a held gesture
 
     def on_button(self, hid_code: int, button_state: int) -> None:
         """Resolve a ``_hidC`` button and emit it.
@@ -93,11 +123,11 @@ class CommandRelay:
         if is_repeatable(hid_code):
             mapping = resolve(hid_code)
             if button_state == _BUTTON_PRESS:
-                self.emit(Command(mapping.action, mapping.samsung_key,
-                                  source=f"button:{hid_code}", repeat=RepeatPhase.START, fast=True))
+                self.emit(Command(mapping.action, mapping.samsung_key, source=f"button:{hid_code}",
+                                  repeat=RepeatPhase.START, repeat_kind=REPEAT_KIND_VOLUME, fast=True))
             elif button_state == _BUTTON_RELEASE:
-                self.emit(Command(mapping.action, mapping.samsung_key,
-                                  source=f"button:{hid_code}", repeat=RepeatPhase.STOP))
+                self.emit(Command(mapping.action, mapping.samsung_key, source=f"button:{hid_code}",
+                                  repeat=RepeatPhase.STOP, repeat_kind=REPEAT_KIND_VOLUME))
             return
         if button_state != _BUTTON_RELEASE:
             return
@@ -108,11 +138,91 @@ class CommandRelay:
         self.emit(Command(mapping.action, mapping.samsung_key, source=f"button:{hid_code}"))
 
     def on_touch(self, action: str, cx: int, cy: int) -> None:
-        """Feed one touch point through the swipe/tap state machine; emit any resolved directions."""
-        for direction in self._swipe.feed(action, cx, cy):
-            key = GESTURE_TO_SAMSUNG.get(direction)
+        """Feed one touch point through the swipe/tap state machine; emit resolved directions.
+
+        With directional hold disabled this is the original behavior: feed the translator and emit any
+        directions it resolves (discrete, on release). With hold enabled, an added dwell state machine
+        turns a swipe held past ``activate_ms`` into a ``RepeatPhase`` START/STOP pair (the async
+        repeater drives the actual auto-repeat), and suppresses the discrete swipe/tap that would
+        otherwise fire on release of a held gesture. Quick swipes never trip the dwell, so their tuned
+        discrete behavior is unchanged.
+        """
+        if not self._hold_config.enabled:
+            for direction in self._swipe.feed(action, cx, cy):
+                self._emit_gesture(direction)
+            return
+
+        if action == "press":
+            self._end_hold_if_active()  # a lost release: a fresh press authoritatively ends the old hold
+            self._reset_hold_state()
+            self._suppress_click_until_press = False
+            self._swipe.feed(action, cx, cy)
+            return
+
+        if action == "hold":
+            self._swipe.feed(action, cx, cy)
+            self._update_hold()
+            return
+
+        if action in ("release", "click"):
+            self._end_hold_if_active()
+            directions = self._swipe.feed(action, cx, cy)
+            if self._hold_was_active:
+                # This gesture was a hold; drop the discrete swipe/tap so we don't double-emit. Also
+                # guard against a stray SELECT arriving as a separate click right after the release.
+                self._suppress_click_until_press = True
+            elif self._suppress_click_until_press and directions == ["SELECT"]:
+                pass  # swallow a trailing tap that belongs to a just-ended hold
+            else:
+                for direction in directions:
+                    self._emit_gesture(direction)
+            self._reset_hold_state()
+            return
+
+        # Unknown actions: let the translator ignore them (keeps malformed frames harmless).
+        self._swipe.feed(action, cx, cy)
+
+    def _emit_gesture(self, direction: str) -> None:
+        key = GESTURE_TO_SAMSUNG.get(direction)
+        if key:
+            self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{direction}"))
+
+    def _update_hold(self) -> None:
+        """Per hold frame: arm a candidate direction and fire START once it has dwelled long enough."""
+        now = self._clock_ms()
+        d = self._swipe.current_direction()
+        if d != self._hold_dir:
+            # Direction changed / dropped below threshold / returned to center: stop any active repeat
+            # (emitting STOP for the OLD direction before overwriting it) and re-arm a fresh dwell.
+            self._end_hold_if_active()
+            self._hold_dir = d
+            self._hold_since_ms = now if d is not None else 0.0
+        elif (
+            d is not None
+            and not self._hold_active
+            and now - self._hold_since_ms >= self._hold_config.activate_ms
+        ):
+            key = GESTURE_TO_SAMSUNG.get(d)
             if key:
-                self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{direction}"))
+                self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{d}",
+                                  repeat=RepeatPhase.START, repeat_kind=REPEAT_KIND_GESTURE, fast=True))
+                self._hold_active = True
+                self._hold_was_active = True
+
+    def _end_hold_if_active(self) -> None:
+        """Emit a STOP for the currently-repeating direction, if any. Uses the OLD ``_hold_dir``."""
+        if self._hold_active and self._hold_dir is not None:
+            key = GESTURE_TO_SAMSUNG.get(self._hold_dir)
+            if key:
+                self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{self._hold_dir}",
+                                  repeat=RepeatPhase.STOP, repeat_kind=REPEAT_KIND_GESTURE))
+        self._hold_active = False
+
+    def _reset_hold_state(self) -> None:
+        self._hold_dir = None
+        self._hold_since_ms = 0.0
+        self._hold_active = False
+        self._hold_was_active = False
 
     def emit(self, command: Command) -> None:
         """Forward a command to the sink, collapsing a duplicate SELECT within the de-dupe window."""

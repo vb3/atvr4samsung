@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # The server passes raw Companion ``_tPh`` codes; normalize them before ``feed``.
 TOUCH_ACTION_NAMES = {
@@ -104,38 +104,59 @@ class SwipeTranslator:
 
         return []
 
+    def _apply_inversion(self, dx: int, dy: int) -> Tuple[int, int]:
+        cfg = self.config
+        return (-dx if cfg.invert_x else dx), (-dy if cfg.invert_y else dy)
+
+    def _dominant_direction(self, dx: int, dy: int) -> Optional[Tuple[str, int]]:
+        """Resolve a displacement to ``(direction, dominant_travel)`` for the **swipe** case only.
+
+        Returns ``None`` when the movement is below ``swipe_threshold`` (too small to be a deliberate
+        swipe) or too diagonal to pick a clear axis. Shared by :meth:`_resolve` (discrete, on release)
+        and :meth:`current_direction` (in-progress, for hold-repeat) so the two can never disagree on
+        which way a swipe points. Tap/dead-zone handling stays in ``_resolve`` — this never returns a
+        tap.
+        """
+        cfg = self.config
+        abs_dx, abs_dy = abs(dx), abs(dy)
+        if max(abs_dx, abs_dy) < cfg.swipe_threshold:
+            return None
+        if abs_dx >= abs_dy:
+            if abs_dx < abs_dy * cfg.dominant_ratio:
+                return None
+            return ("RIGHT" if dx > 0 else "LEFT"), abs_dx
+        if abs_dy < abs_dx * cfg.dominant_ratio:
+            return None
+        return ("DOWN" if dy > 0 else "UP"), abs_dy
+
+    def current_direction(self) -> Optional[str]:
+        """The direction of the in-progress gesture (press → last touch point), or ``None``.
+
+        Pure and clock-free: reports the dominant swipe direction if the current net displacement is a
+        clear, past-threshold swipe, else ``None`` (below threshold, ambiguous diagonal, or no active
+        touch). Used by the relay's hold-repeat dwell logic; never returns a tap/SELECT.
+        """
+        track = self._track
+        if track is None:
+            return None
+        dx, dy = self._apply_inversion(track.last_x - track.start_x, track.last_y - track.start_y)
+        resolved = self._dominant_direction(dx, dy)
+        return resolved[0] if resolved else None
+
     def _resolve(self, x0: int, y0: int, x1: int, y1: int) -> List[str]:
         cfg = self.config
-        dx = x1 - x0
-        dy = y1 - y0
-        if cfg.invert_x:
-            dx = -dx
-        if cfg.invert_y:
-            dy = -dy
-
-        abs_dx, abs_dy = abs(dx), abs(dy)
-        travel = max(abs_dx, abs_dy)
+        dx, dy = self._apply_inversion(x1 - x0, y1 - y0)
+        travel = max(abs(dx), abs(dy))
 
         # Small total movement -> it was a tap, not a swipe.
         if travel <= cfg.tap_max_travel:
             return ["SELECT"]
 
-        # Too small to be a deliberate swipe (but bigger than a tap) -> ignore (dead zone).
-        if travel < cfg.swipe_threshold:
+        resolved = self._dominant_direction(dx, dy)
+        if resolved is None:
+            # Below swipe_threshold (dead zone) or too diagonal -> ignore.
             return []
-
-        # Decide dominant axis; reject ambiguous diagonals.
-        if abs_dx >= abs_dy:
-            if abs_dx < abs_dy * cfg.dominant_ratio:
-                return []
-            direction = "RIGHT" if dx > 0 else "LEFT"
-            dominant = abs_dx
-        else:
-            if abs_dy < abs_dx * cfg.dominant_ratio:
-                return []
-            direction = "DOWN" if dy > 0 else "UP"
-            dominant = abs_dy
-
+        direction, dominant = resolved
         return [direction] * self._repeat_count(dominant)
 
     def _repeat_count(self, dominant_travel: int) -> int:

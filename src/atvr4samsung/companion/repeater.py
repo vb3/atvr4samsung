@@ -1,16 +1,22 @@
-"""Hold-to-repeat driver for volume keys.
+"""Hold-to-repeat driver for a held remote key.
 
-iOS Control Center sends a held Volume Up/Down as a single HID **down** then a delayed **up** (not a
-stream of frames), so the bridge synthesizes the repeat: while a volume button is held, keep sending
-discrete ``KEY_VOLUP``/``KEY_VOLDOWN`` clicks at a keyboard-style cadence until release.
+While a key is "held", keep sending discrete ``KEY_*`` clicks at a keyboard-style cadence until
+release. Two things drive holds today:
+- **Directional swipes** (LEFT/RIGHT/UP/DOWN): iOS streams real touch frames for the whole hold, so
+  the relay detects the dwell and drives START/STOP — this is the path that actually works.
+- **Volume Up/Down buttons**: iOS Control Center does **not** stream hold frames for these (press and
+  release effectively arrive together regardless of how long you hold), so the button hold never
+  registers as a real hold — this wiring is retained but largely inert. Kept generic here so the same
+  driver serves whichever inputs do provide a hold signal.
 
 Design (see docs/lld.md §4):
-- This component owns **all** hold state and the **only** timer. The relay stays stateless; the server
-  registers start/stop synchronously on the loop thread so a release can never race ahead of its press.
+- This component owns **all** repeat state and the **only** timer. The relay stays stateless; the
+  server registers start/stop synchronously on the loop thread so a release can't race ahead of press.
 - The **immediate first click** is dispatched by the server as an independent, uncancellable task, so a
   fast tap always yields exactly one click. This component drives only the **delayed repeats**.
-- Fails closed: a lost release just lets the repeat hit ``max_hold`` and end; a send error ends the
-  loop rather than hammering the TV; ``stop_all`` cancels everything on disconnect/session teardown.
+- Fails closed: a lost release lets the repeat hit ``max_hold`` (or ``should_continue`` returning
+  False) and end; a send error ends the loop rather than hammering the TV; ``stop_all`` cancels
+  everything on disconnect/session teardown.
 - Only one direction repeats at a time — starting one cancels the other.
 """
 from __future__ import annotations
@@ -25,12 +31,13 @@ _LOGGER = logging.getLogger(__name__)
 SendKey = Callable[[str], Awaitable[None]]
 Sleep = Callable[[float], Awaitable[None]]
 Clock = Callable[[], float]
+ShouldContinue = Callable[[], bool]
 
 
 @dataclass(frozen=True)
-class VolumeRepeatConfig:
-    """Cadence for held-volume auto-repeat. Keyboard-style: an immediate step (sent by the server),
-    a short delay before repeats begin, then steady repeats, hard-capped so a lost release can't run
+class HoldRepeatConfig:
+    """Cadence for held-key auto-repeat. Keyboard-style: an immediate step (sent by the server), a
+    short delay before repeats begin, then steady repeats, hard-capped so a lost release can't run
     away. Defaults are starting points; the Samsung client's per-send pacing is bypassed for these
     sends (``fast``) so this cadence is what actually reaches the TV."""
 
@@ -39,11 +46,13 @@ class VolumeRepeatConfig:
     max_hold: float = 10.0       # safety cap: stop repeating after this long even if no release
 
 
-class VolumeRepeater:
-    """Drive delayed auto-repeat of a held volume key.
+class HoldRepeater:
+    """Drive delayed auto-repeat of a held key.
 
-    ``send`` sends one discrete click for a key. ``sleep``/``clock`` are injectable so the cadence and
-    cap are deterministically testable against a virtual clock. All public mutators
+    ``send`` sends one discrete click for a key. ``should_continue`` (optional) is polled before every
+    delayed send; returning False (or raising) ends the loop — used as a dead-man switch when the
+    input has a liveness signal (e.g. touch frames stop arriving). ``sleep``/``clock`` are injectable so
+    the cadence and cap are deterministically testable against a virtual clock. All public mutators
     (:meth:`start`/:meth:`stop`) are **synchronous** and must be called on the event-loop thread; they
     create/cancel the repeat task without awaiting, so ordering matches the frame order.
     """
@@ -52,22 +61,25 @@ class VolumeRepeater:
         self,
         send: SendKey,
         *,
-        config: Optional[VolumeRepeatConfig] = None,
+        config: Optional[HoldRepeatConfig] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         sleep: Sleep = asyncio.sleep,
         clock: Clock = None,  # type: ignore[assignment]
+        should_continue: Optional[ShouldContinue] = None,
     ) -> None:
         self._send = send
-        self._config = config or VolumeRepeatConfig()
+        self._config = config or HoldRepeatConfig()
         self._loop = loop
         self._sleep = sleep
         self._clock = clock or (loop.time if loop is not None else asyncio.get_event_loop().time)
+        self._should_continue = should_continue
         # At most one active direction; map key -> its repeat task so stop()/start() can cancel it.
         self._tasks: Dict[str, asyncio.Task] = {}
 
     @property
-    def volume_hold_active(self) -> bool:
-        """True while a volume key is being held (used to suppress the slider's SetVolume path)."""
+    def active(self) -> bool:
+        """True while a key is being held/repeated (used to suppress conflicting paths, e.g. the
+        volume slider's SetVolume while a volume hold is active)."""
         return bool(self._tasks)
 
     def start(self, key: str) -> None:
@@ -113,13 +125,19 @@ class VolumeRepeater:
         try:
             await self._sleep(config.initial_delay)
             while self._clock() < deadline:
+                # Dead-man: poll liveness before EVERY send (incl. the first delayed one). Fail closed —
+                # a predicate that raises stops the loop rather than repeating on a lost input signal.
+                if not self._alive():
+                    _LOGGER.debug("Hold repeat for %s stopped (liveness signal ended)", key)
+                    break
                 await self._send(key)
                 await self._sleep(config.interval)
-            _LOGGER.debug("Volume repeat for %s hit the %.0fs safety cap", key, config.max_hold)
+            else:
+                _LOGGER.debug("Hold repeat for %s hit the %.0fs safety cap", key, config.max_hold)
         except asyncio.CancelledError:
             raise
         except Exception:  # fail closed: log once and stop rather than hammer a broken socket
-            _LOGGER.warning("Volume repeat for %s stopped after a send error", key, exc_info=True)
+            _LOGGER.warning("Hold repeat for %s stopped after a send error", key, exc_info=True)
         finally:
             # Only clear our own handle; a concurrent restart may already own the slot. Guard against
             # current_task() failing if the loop is already tearing down (process/test shutdown).
@@ -128,3 +146,13 @@ class VolumeRepeater:
                     del self._tasks[key]
             except RuntimeError:
                 self._tasks.pop(key, None)
+
+    def _alive(self) -> bool:
+        """Liveness gate for the repeat loop; fails closed if the predicate raises."""
+        if self._should_continue is None:
+            return True
+        try:
+            return bool(self._should_continue())
+        except Exception:
+            _LOGGER.warning("Hold repeat should_continue predicate raised; stopping", exc_info=True)
+            return False

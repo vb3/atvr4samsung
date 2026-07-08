@@ -7,7 +7,13 @@ behavior, the duplicate-SELECT collapse, the SetVolume step).
 import unittest
 
 from atvr4samsung.bridge.keymap import Action
-from atvr4samsung.companion.relay import CommandRelay, RepeatPhase, volume_key_for
+from atvr4samsung.companion.relay import (
+    CommandRelay,
+    DirectionalHoldConfig,
+    REPEAT_KIND_GESTURE,
+    RepeatPhase,
+    volume_key_for,
+)
 
 
 class _Clock:
@@ -141,6 +147,135 @@ class TestTouchDecode(unittest.TestCase):
         relay, sink, _ = _relay()
         relay.on_touch("press", 500, 500)
         relay.on_touch("release", 505, 500)  # tiny travel -> tap -> SELECT
+        self.assertEqual([c.samsung_key for c in sink], ["KEY_ENTER"])
+
+
+def _hold_relay(activate_ms=400.0):
+    """A relay with directional hold-repeat enabled, driven by a controllable clock."""
+    sink = []
+    clock = _Clock()
+    relay = CommandRelay(
+        sink.append, clock_ms=clock,
+        hold_config=DirectionalHoldConfig(enabled=True, activate_ms=activate_ms),
+    )
+    return relay, sink, clock
+
+
+def _starts(sink):
+    return [c for c in sink if c.repeat is RepeatPhase.START]
+
+
+def _stops(sink):
+    return [c for c in sink if c.repeat is RepeatPhase.STOP]
+
+
+def _discrete(sink):
+    return [c for c in sink if c.repeat is None]
+
+
+class TestDirectionalHold(unittest.TestCase):
+    """Swipe-and-hold auto-repeat FSM (relay side): dwell -> START, release -> STOP + suppression."""
+
+    def test_disabled_is_unchanged_discrete_behavior(self):
+        relay, sink, _ = _relay()  # hold disabled
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        relay.on_touch("hold", 850, 500)
+        relay.on_touch("release", 850, 500)
+        self.assertEqual([c.samsung_key for c in sink], ["KEY_RIGHT"])
+        self.assertTrue(all(c.repeat is None for c in sink))
+
+    def test_quick_swipe_below_dwell_stays_discrete(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 200.0  # < 400ms dwell
+        relay.on_touch("release", 850, 500)
+        self.assertEqual(_starts(sink), [])
+        self.assertEqual([c.samsung_key for c in _discrete(sink)], ["KEY_RIGHT"])
+
+    def test_hold_past_dwell_emits_one_start(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)   # arms RIGHT
+        clock.now += 500.0                 # past the 400ms dwell
+        relay.on_touch("hold", 850, 500)   # activates
+        relay.on_touch("hold", 850, 500)   # still held -> no second START
+        starts = _starts(sink)
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0].samsung_key, "KEY_RIGHT")
+        self.assertEqual(starts[0].repeat_kind, REPEAT_KIND_GESTURE)
+        self.assertTrue(starts[0].fast)
+
+    def test_release_after_hold_stops_and_suppresses_discrete(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)   # START
+        relay.on_touch("release", 850, 500)
+        self.assertEqual(len(_starts(sink)), 1)
+        self.assertEqual(len(_stops(sink)), 1)
+        self.assertEqual(_discrete(sink), [], "the held swipe must not also fire a discrete key")
+
+    def test_return_to_center_stops_and_suppresses(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)   # START RIGHT
+        relay.on_touch("hold", 510, 500)   # back near origin -> below threshold -> STOP
+        relay.on_touch("release", 510, 500)
+        self.assertEqual(len(_stops(sink)), 1)
+        self.assertEqual(_discrete(sink), [])
+
+    def test_reversal_stops_old_and_rearms_new(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)   # START RIGHT
+        relay.on_touch("hold", 150, 500)   # reverse past threshold LEFT -> STOP RIGHT, arm LEFT
+        stops = _stops(sink)
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0].samsung_key, "KEY_RIGHT", "STOP uses the OLD direction")
+        clock.now += 500.0
+        relay.on_touch("hold", 150, 500)   # LEFT dwell elapsed -> START LEFT
+        starts = _starts(sink)
+        self.assertEqual([c.samsung_key for c in starts], ["KEY_RIGHT", "KEY_LEFT"])
+
+    def test_new_press_stops_a_stale_active_hold(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)   # START RIGHT (release then lost)
+        relay.on_touch("press", 500, 500)  # a fresh press must end the stale hold
+        self.assertEqual(len(_stops(sink)), 1)
+        self.assertEqual(_stops(sink)[0].samsung_key, "KEY_RIGHT")
+
+    def test_click_after_held_release_is_suppressed(self):
+        relay, sink, clock = _hold_relay()
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)   # START
+        relay.on_touch("release", 850, 500)  # STOP + suppress
+        relay.on_touch("click", 850, 500)  # a stray tap right after -> must be swallowed
+        self.assertEqual([c.samsung_key for c in _discrete(sink)], [])
+
+    def test_fresh_tap_after_a_new_press_is_not_swallowed(self):
+        relay, sink, clock = _hold_relay()
+        # First: a held gesture that sets the suppress flag.
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("hold", 850, 500)
+        clock.now += 500.0
+        relay.on_touch("hold", 850, 500)
+        relay.on_touch("release", 850, 500)
+        sink.clear()
+        # Now a brand-new deliberate tap: press clears the suppress flag, so SELECT must pass.
+        relay.on_touch("press", 500, 500)
+        relay.on_touch("release", 504, 500)
         self.assertEqual([c.samsung_key for c in sink], ["KEY_ENTER"])
 
 

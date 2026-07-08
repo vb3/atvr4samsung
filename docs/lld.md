@@ -20,7 +20,7 @@ src/atvr4samsung/
   companion/
     server.py            BridgeCompanionService: subclass of the base server that relays to Samsung
     relay.py             pure decode layer: button/touch -> Command (incl. volume hold START/STOP)   (pure)
-    repeater.py          VolumeRepeater: async hold-to-repeat driver for held volume keys
+    repeater.py          HoldRepeater: async hold-to-repeat driver (held swipe direction / volume)
     discovery.py         mDNS advert of _companion-link._tcp; CompanionAdvertiser re-advertises on IP change
     protocol/            first-party Companion Link implementation (derived from pyatv v0.18.0, MIT)
       appletv.py         base FakeCompanionService: framing, dispatch, HID/touch decode, session handlers
@@ -89,7 +89,7 @@ overrides handlers to relay decoded commands. Notable overrides:
   control (see §5).
 - `handle_mediacontrolcommand` — iOS-26 `MediaControlCommand` flow (GetVolume/SetVolume/captions).
   The SetVolume (slider) step is **suppressed while a HID volume hold is active**
-  (`_repeater.volume_hold_active`) so the two volume paths can't double-step (§4).
+  (`_vol_repeater.active`) so the two volume paths can't double-step (§4).
 - `handle__tistart` — establish the RTI text-input session and register as an RTI client, but reply
   **unfocused** so iOS doesn't pop the keyboard on connect; focus is driven later by the TV's IME.
 - `handle__tic` — decode the iOS text operation (insert / `deletionCount` backspace / `textToAssert`
@@ -144,33 +144,59 @@ supersedes the earlier belief that `KEY_PLAY_BACK` was invalid + a `PlayPauseTog
 `TVInputDevice` name, **not** a WebSocket `ms.remote.control` key — it no-ops over the WebSocket
 (verified on the Frame), so don't use it.
 
-**Volume hold-to-repeat — `bridge/keymap.REPEATABLE_BUTTONS` + `companion/repeater.py`:** holding
-Volume Up/Down keeps stepping the TV volume, keyboard-style, until release. iOS 26 sends a held CC
-volume button as a **single HID `_hidC` 8/9 down then a delayed up** (not a stream of frames), so the
-bridge synthesizes the repeat:
-- The relay is **stateless**: on press it emits `Command(repeat=RepeatPhase.START, fast=True)`; on
-  release `RepeatPhase.STOP`. It sends no click itself for volume.
-- `_dispatch_sink` handles START/STOP **synchronously** in frame order (so a release can never race
-  ahead of its press). START also fires **one guaranteed immediate click** as an independent,
-  uncancellable task — so a fast tap always yields exactly one step, matching every other button.
-- `VolumeRepeater` owns the **only** timer and all hold state: after the immediate click it waits
-  `initial_delay` (**0.35 s**) then repeats every `interval` (**0.18 s**), hard-capped at `max_hold`
-  (**10 s**). Only one direction repeats at a time (starting one cancels the other). Cadence lives in
-  `VolumeRepeatConfig` (code constants, like `GestureConfig` — not in `config.yaml`).
-- **Fails closed:** a lost release just lets the repeat hit the cap and end; a send error ends the loop
-  (no hammering); `connection_lost` / `TVRCSessionStop` call `stop_all()`. While a hold is active the
-  SetVolume slider path is suppressed so the two volume sources can't double-step.
-- Repeat sends use `key_press_delay=0` (`Command.fast`) and are serialized (with every other key send)
-  by the client's `_send_lock` on the one shared websocket.
-- **Validation caveat:** the single-down/delayed-up assumption is confirmed by the down/up wire model
-  but the exact CC hold behavior wants an on-device capture to pin (hardware check, not unit-tested);
-  the design degrades gracefully either way.
+**Hold-to-repeat — `companion/repeater.py` `HoldRepeater`:** a held input keeps stepping a key,
+keyboard-style, until release. One generic async driver serves two inputs (each with its own instance,
+cadence, and state):
+
+- **Directional swipe (the path that works).** A swipe held past `activate_ms` (**~400 ms** dwell)
+  starts auto-repeating that direction (LEFT/RIGHT/UP/DOWN) — useful for scrubbing a timeline. The
+  relay owns the dwell FSM (`bridge/gestures.SwipeTranslator.current_direction()` classifies the
+  in-progress press→last displacement; shares the axis/threshold helper with the discrete `_resolve`
+  so they never disagree). On dwell it emits `Command(repeat=RepeatPhase.START, repeat_kind="gesture",
+  fast=True)`; release / reversal / return-to-center emits STOP. A quick swipe never trips the dwell,
+  so its tuned discrete behavior is unchanged, and a held gesture's discrete swipe/tap is **suppressed**
+  so it can't double-fire.
+- **Volume Up/Down (retained but largely inert).** The original design assumed iOS sends a held CC
+  volume button as a single HID `_hidC` 8/9 down + delayed up. On-device this doesn't hold: iOS
+  effectively sends press+release together regardless of hold, so the button hold never registers —
+  the wiring stays (generic, harmless) but doesn't repeat in practice.
+
+Mechanics (shared):
+- The relay is **stateless for buttons** / owns only the touch dwell FSM; `_dispatch_sink` handles
+  START/STOP **synchronously** in frame order (a release can't race ahead of its press) and routes by
+  `repeat_kind` to the volume vs directional `HoldRepeater`. START fires **one guaranteed immediate
+  click** as an independent, uncancellable task (so a fast tap/swipe always yields exactly one step),
+  then `repeater.start(key)` drives only the delayed repeats.
+- `HoldRepeater` owns the **only** timer and all hold state: after the immediate click it waits
+  `initial_delay` then repeats every `interval`, hard-capped at `max_hold`. Only one direction repeats
+  at a time (starting one cancels the other). Directional cadence: `initial_delay` **0.25 s**,
+  `interval` **0.12 s**, `max_hold` **15 s** (`DirectionalHoldConfig`, code constants — not
+  `config.yaml`). It also accepts an optional `should_continue` liveness gate (generic; **unused** for
+  directional — see the stop model below).
+- **Stopping a directional hold (no frame-based dead-man).** iOS sends **no touch frames for a
+  held-but-still finger** — observed >1.2 s gaps mid-hold — so a frame-silence dead-man would cut real
+  holds (and couldn't tell a still finger from a lost release: both are silent). Instead the repeat is
+  stopped by the touch **`release`** (reliable on the live TCP link; `handle__hidt` fails closed so a
+  malformed release still drives a STOP), by **`_touchStop`** (touch session ended without a release —
+  Control Center dismissed / phone locked / backgrounded), and by teardown (`connection_lost` /
+  `TVRCSessionStop` → `stop_all()`). `max_hold` (15 s) is the final runaway backstop. While a **volume**
+  hold is active the SetVolume slider path is suppressed so the two volume sources can't double-step.
+- **Fails closed:** a send error ends the loop (no hammering); repeat sends use `key_press_delay=0`
+  (`Command.fast`) and are serialized with every other key send by the client's `_send_lock` on the one
+  shared websocket.
 
 
 touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). The translator resolves a
 press→release into a **tap** (total travel ≤ `tap_max_travel`=60 → SELECT) or a **swipe** (travel ≥
 `swipe_threshold`=120 → dominant axis via `dominant_ratio`=1.3 → UP/DOWN/LEFT/RIGHT). Directions map
 to keys via `GESTURE_TO_SAMSUNG`. Thresholds live in `GestureConfig` (tunable).
+
+- **iOS emits two segments per flick (hard-won):** a fast full-width flick arrives as **two** separate
+  press→release pairs ~3 ms apart (momentum follow-through); a deliberate/partial swipe is one. With
+  `repeat_every`=**350** (travel-proportional repeats) a deliberate swipe = **1** step while a fast
+  flick scrolls **~3** — precision preserved, flicks scroll far. `key_press_delay`=**0.05 s** (set in
+  `app.py`) lets a rapid burst of discrete swipes drain smoothly without flooding the TV.
+- **Swipe-and-hold** auto-repeats the held direction — see *Hold-to-repeat* above.
 
 ## 5. The iOS-26 capability gates (hard-won — do not regress)
 
@@ -292,8 +318,9 @@ Hard-won wire facts (captured from a real iPhone, iOS 26, against the Frame TV):
   web browser, settings). **YouTube/Netflix render their own keyboards and emit no IME events**, so
   typing there does nothing — confirmed on hardware.
 - **Latency:** `samsungtvws` sleeps `key_press_delay` (default 1s) after every command. Text sends pass
-  `key_press_delay=0` (live typing must be prompt); normal button presses default to **0.25s** (paces
-  the TV without dropping rapid presses). Volume hold-repeat sends also pass `key_press_delay=0`
-  (`Command.fast`) so the `VolumeRepeater`'s own interval — not the library sleep — sets the cadence.
-  All key sends (and their one-shot reconnect) are serialized by the client's `_send_lock` so a repeat
+  `key_press_delay=0` (live typing must be prompt); normal button presses default to **0.25s**, and
+  `app.py` sets **0.05s** so a rapid burst of discrete swipes drains smoothly. Hold-repeat sends also
+  pass `key_press_delay=0` (`Command.fast`) so the `HoldRepeater`'s own interval — not the library
+  sleep — sets the cadence. All key sends (and their one-shot reconnect) are serialized by the client's
+  `_send_lock` so a repeat
   can't interleave with another button on the single websocket.

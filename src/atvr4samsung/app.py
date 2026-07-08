@@ -74,9 +74,11 @@ async def run(config: Config) -> None:
     # Imported lazily so `--check` and tests don't require the runtime deps (samsungtvws).
     from zeroconf import Zeroconf
 
+    from .bridge.gestures import GestureConfig
     from .companion.discovery import CompanionAdvertiser
     from .companion.protocol.paired_clients import PairedClients
     from .companion.protocol.server_identity import load_or_create_identity
+    from .companion.relay import DirectionalHoldConfig
     from .companion.server import make_ime_focus_handler, make_samsung_dispatch, serve
     from .samsung.client import SamsungFrameClient
 
@@ -97,15 +99,23 @@ async def run(config: Config) -> None:
             wol_enabled=config.samsung.wol.enabled,
             wol_broadcast=config.samsung.wol.broadcast,
             wol_port=config.samsung.wol.port,
+            key_press_delay=0.05,  # snappy pacing for rapid discrete swipes (validated on-device)
         )
         stack.push_async_callback(client.close)  # always clean up, even though connect is deferred
 
         dispatch = make_samsung_dispatch(client)
+        # Swipe tuning (validated on-device): repeat_every=350 keeps a deliberate swipe = 1 step while
+        # a fast full-width flick scrolls ~3; key_press_delay=0.05 lets a rapid burst drain smoothly.
+        gesture_config = GestureConfig(repeat_every=350)
+        # Swipe-and-hold auto-repeat (directional scroll): dwell ~400ms then repeat.
+        hold_config = DirectionalHoldConfig(enabled=True)
         server, state = await serve(
             dispatch,
             host="0.0.0.0",
             port=config.companion.port,
             device_name=config.companion.device_name,
+            gesture_config=gesture_config,
+            hold_config=hold_config,
             pin=int(config.companion.pin),
             unique_id=server_uuid,
             private_key=private_key,

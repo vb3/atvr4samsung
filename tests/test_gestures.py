@@ -126,5 +126,52 @@ class TestMalformedAndStateHandling(unittest.TestCase):
         )
 
 
+class TestCurrentDirection(unittest.TestCase):
+    """The in-progress classifier used by hold-repeat: dominant direction of press->last, or None.
+
+    Must agree with the discrete resolver on which way a swipe points (they share the helper), and must
+    never report a tap/SELECT.
+    """
+
+    def _track(self, x0, y0, x1, y1, cfg=None):
+        t = SwipeTranslator(cfg)
+        t.feed("press", x0, y0)
+        t.feed("hold", x1, y1)
+        return t
+
+    def test_none_before_any_touch(self):
+        self.assertIsNone(SwipeTranslator().current_direction())
+
+    def test_reports_dominant_direction_past_threshold(self):
+        self.assertEqual(self._track(500, 500, 850, 500).current_direction(), "RIGHT")
+        self.assertEqual(self._track(500, 500, 150, 500).current_direction(), "LEFT")
+        self.assertEqual(self._track(500, 500, 500, 850).current_direction(), "DOWN")
+        self.assertEqual(self._track(500, 500, 500, 150).current_direction(), "UP")
+
+    def test_below_swipe_threshold_is_none(self):
+        # Travel 100 < swipe_threshold 120 -> not yet a swipe, even though > a tap.
+        self.assertIsNone(self._track(500, 500, 600, 500).current_direction())
+
+    def test_ambiguous_diagonal_is_none(self):
+        # dx=200, dy=190 -> 200 < 190*1.3 -> too diagonal.
+        self.assertIsNone(self._track(500, 500, 700, 690).current_direction())
+
+    def test_never_returns_select_for_a_tap(self):
+        # A tiny movement resolves to SELECT on release, but current_direction never reports a tap.
+        self.assertIsNone(self._track(500, 500, 520, 505).current_direction())
+
+    def test_agrees_with_discrete_resolution(self):
+        t = SwipeTranslator()
+        t.feed("press", 500, 500)
+        t.feed("hold", 800, 560)  # clearly RIGHT
+        self.assertEqual(t.current_direction(), "RIGHT")
+        # Releasing at the same point must resolve to the same direction discretely.
+        self.assertEqual(t.feed("release", 800, 560), ["RIGHT"])
+
+    def test_honors_axis_inversion(self):
+        cfg = GestureConfig(invert_x=True)
+        self.assertEqual(self._track(500, 500, 850, 500, cfg).current_direction(), "LEFT")
+
+
 if __name__ == "__main__":
     unittest.main()

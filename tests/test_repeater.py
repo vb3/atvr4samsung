@@ -7,7 +7,7 @@ deterministic — no real time, no TV, no network.
 import asyncio
 import unittest
 
-from atvr4samsung.companion.repeater import VolumeRepeater, VolumeRepeatConfig
+from atvr4samsung.companion.repeater import HoldRepeater, HoldRepeatConfig
 
 
 class _Controller:
@@ -46,8 +46,8 @@ async def _settle() -> None:
 
 
 def _repeater(send, controller, **config):
-    cfg = VolumeRepeatConfig(**config) if config else VolumeRepeatConfig()
-    return VolumeRepeater(
+    cfg = HoldRepeatConfig(**config) if config else HoldRepeatConfig()
+    return HoldRepeater(
         send,
         config=cfg,
         loop=asyncio.get_event_loop(),
@@ -56,7 +56,7 @@ def _repeater(send, controller, **config):
     )
 
 
-class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
+class TestHoldRepeater(unittest.IsolatedAsyncioTestCase):
     async def test_no_repeat_before_initial_delay(self):
         sends = []
 
@@ -73,7 +73,7 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sends, [])
         self.assertEqual(len(ctl.pending), 1)
         self.assertAlmostEqual(ctl.pending[0][0], 0.35)
-        self.assertTrue(rep.volume_hold_active)
+        self.assertTrue(rep.active)
         await rep.stop_all()
 
     async def test_cancel_during_initial_delay_yields_zero_repeats(self):
@@ -90,7 +90,7 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         await _settle()
 
         self.assertEqual(sends, [])
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
 
     async def test_repeats_at_interval_until_stop(self):
         sends = []
@@ -112,7 +112,7 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         await _settle()
         # No further sends after stop.
         self.assertEqual(len(sends), 2)
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
 
     async def test_safety_cap_stops_repeating(self):
         sends = []
@@ -127,12 +127,12 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         await _settle()
 
         for _ in range(10):
-            if not rep.volume_hold_active:
+            if not rep.active:
                 break
             await ctl.advance_one()
 
         self.assertEqual(sends, ["KEY_VOLDOWN", "KEY_VOLDOWN", "KEY_VOLDOWN"])
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
 
     async def test_starting_other_direction_cancels_the_first(self):
         async def send(key):
@@ -147,7 +147,7 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("KEY_VOLUP", rep._tasks)
         self.assertIn("KEY_VOLDOWN", rep._tasks)
-        self.assertTrue(rep.volume_hold_active)
+        self.assertTrue(rep.active)
         await rep.stop_all()
 
     async def test_restarting_same_direction_is_a_noop(self):
@@ -174,7 +174,7 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         await _settle()
         await ctl.advance_one()  # release initial delay -> send raises -> loop ends, handle cleared
 
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
 
     async def test_stop_all_cancels_and_awaits(self):
         async def send(key):
@@ -184,10 +184,10 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         rep = _repeater(send, ctl)
         rep.start("KEY_VOLUP")
         await _settle()
-        self.assertTrue(rep.volume_hold_active)
+        self.assertTrue(rep.active)
 
         await rep.stop_all()
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
 
     async def test_stop_and_stop_all_are_safe_when_idle(self):
         async def send(key):
@@ -197,7 +197,72 @@ class TestVolumeRepeater(unittest.IsolatedAsyncioTestCase):
         rep = _repeater(send, ctl)
         rep.stop("KEY_VOLUP")  # not held -> no error
         await rep.stop_all()   # nothing active -> no error
-        self.assertFalse(rep.volume_hold_active)
+        self.assertFalse(rep.active)
+
+
+class TestShouldContinue(unittest.IsolatedAsyncioTestCase):
+    """The dead-man gate (used by the directional repeater keyed on touch-frame liveness)."""
+
+    def _repeater(self, send, ctl, should_continue, **config):
+        cfg = HoldRepeatConfig(**config) if config else HoldRepeatConfig()
+        return HoldRepeater(
+            send, config=cfg, loop=asyncio.get_event_loop(),
+            sleep=ctl.sleep, clock=ctl.clock, should_continue=should_continue,
+        )
+
+    async def test_stops_before_first_send_when_not_alive(self):
+        sends = []
+
+        async def send(key):
+            sends.append(key)
+
+        ctl = _Controller()
+        rep = self._repeater(send, ctl, should_continue=lambda: False,
+                             initial_delay=0.25, interval=0.12, max_hold=15.0)
+        rep.start("KEY_RIGHT")
+        await _settle()
+        await ctl.advance_one()  # release initial delay -> loop checks should_continue BEFORE sending
+
+        self.assertEqual(sends, [], "a dead liveness signal must stop before the first repeat send")
+        self.assertFalse(rep.active)
+
+    async def test_stops_mid_run_when_liveness_ends(self):
+        sends = []
+        alive = {"v": True}
+
+        async def send(key):
+            sends.append(key)
+
+        ctl = _Controller()
+        rep = self._repeater(send, ctl, should_continue=lambda: alive["v"],
+                             initial_delay=0.25, interval=0.12, max_hold=15.0)
+        rep.start("KEY_RIGHT")
+        await _settle()
+        await ctl.advance_one()  # first repeat
+        self.assertEqual(sends, ["KEY_RIGHT"])
+        alive["v"] = False       # touch frames stopped arriving
+        await ctl.advance_one()  # next iteration checks should_continue -> stop
+        self.assertEqual(sends, ["KEY_RIGHT"], "no send after the liveness signal ended")
+        self.assertFalse(rep.active)
+
+    async def test_predicate_that_raises_fails_closed(self):
+        sends = []
+
+        def boom():
+            raise RuntimeError("predicate blew up")
+
+        async def send(key):
+            sends.append(key)
+
+        ctl = _Controller()
+        rep = self._repeater(send, ctl, should_continue=boom,
+                             initial_delay=0.25, interval=0.12, max_hold=15.0)
+        rep.start("KEY_RIGHT")
+        await _settle()
+        await ctl.advance_one()  # loop polls the predicate, which raises -> fail closed, no send
+
+        self.assertEqual(sends, [])
+        self.assertFalse(rep.active)
 
 
 if __name__ == "__main__":

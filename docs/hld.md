@@ -39,7 +39,7 @@ WebSocket API.
 
 | Component | Responsibility | Code |
 |---|---|---|
-| **Companion server** | Emulated Apple TV: mDNS advertise, pairing (SRP-6a + Curve25519), encrypted session, decode `_hidC` buttons + `_hidT` touch/swipe + media-control frames; relay decisions + volume hold-to-repeat. | `companion/server.py`, `companion/relay.py`, `companion/repeater.py`, `companion/protocol/`, `companion/discovery.py` |
+| **Companion server** | Emulated Apple TV: mDNS advertise, pairing (SRP-6a + Curve25519), encrypted session, decode `_hidC` buttons + `_hidT` touch/swipe + media-control frames; relay decisions + swipe/volume hold-to-repeat. | `companion/server.py`, `companion/relay.py`, `companion/repeater.py`, `companion/protocol/`, `companion/discovery.py` |
 | **Command mapper** | Pure decision logic: Apple button → Samsung `KEY_*`; swipe → discrete direction; play/pause toggle. No I/O, fully unit-tested. | `bridge/keymap.py`, `bridge/gestures.py` |
 | **Samsung client** | Async WebSocket control (Tizen `KEY_*`), token persistence, Wake-on-LAN magic packet. | `samsung/client.py` |
 | **App / service** | Wire the above together, load config, advertise, run under systemd. | `app.py`, `config.py` |
