@@ -104,12 +104,6 @@ KEYMAP: Dict[AppleButton, Mapping] = {
 
 _UNKNOWN = Mapping(Action.UNMAPPED, None, note="unknown HID code")
 
-# Buttons that auto-repeat while held (press→repeat→release), rather than firing once on release.
-# Scoped to volume: holding Volume Up/Down should keep stepping the TV volume like a keyboard repeat.
-# The bridge synthesizes the repeat (see companion/repeater.py) — iOS sends a single HID down then a
-# delayed up, not a stream of frames.
-REPEATABLE_BUTTONS = frozenset({AppleButton.VolumeUp, AppleButton.VolumeDown})
-
 
 def resolve(hid_code: int) -> Mapping:
     """Unknown/future HID codes resolve to ``UNMAPPED`` so malformed frames can't crash the server."""
@@ -118,14 +112,6 @@ def resolve(hid_code: int) -> Mapping:
     except ValueError:
         return _UNKNOWN
     return KEYMAP.get(button, _UNKNOWN)
-
-
-def is_repeatable(hid_code: int) -> bool:
-    """True if this button should auto-repeat while held (currently Volume Up/Down only)."""
-    try:
-        return AppleButton(hid_code) in REPEATABLE_BUTTONS
-    except ValueError:
-        return False
 
 
 GESTURE_TO_SAMSUNG: Dict[str, str] = {

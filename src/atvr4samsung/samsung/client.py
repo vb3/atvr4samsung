@@ -277,11 +277,11 @@ class SamsungFrameClient:
         press-and-hold semantics. Reconnects once and retries if the socket has dropped.
 
         ``key_press_delay`` overrides samsungtvws' post-send pacing for this call (``None`` keeps the
-        instance default of :attr:`key_press_delay`). Volume auto-repeat passes ``0`` so the repeater's
+        instance default of :attr:`key_press_delay`). Hold auto-repeat passes ``0`` so the repeater's
         own cadence — not the library's ~0.25s sleep — controls the repeat rate.
         """
         self._validate_key_cmd(cmd)
-        # Serialize key sends (and their one-shot reconnect) so concurrent presses — e.g. a volume
+        # Serialize key sends (and their one-shot reconnect) so concurrent presses — e.g. a held-swipe
         # auto-repeat overlapping another button — can't interleave on the single shared websocket.
         async with self._send_lock:
             await self._ensure_connected()

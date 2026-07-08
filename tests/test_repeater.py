@@ -1,4 +1,4 @@
-"""Unit tests for the volume hold-repeat driver.
+"""Unit tests for the hold-repeat driver.
 
 Stdlib only (``IsolatedAsyncioTestCase``): the repeater's timing is injected via a controllable
 ``sleep``/``clock`` so cadence, the safety cap, cancellation, and fail-closed behavior are

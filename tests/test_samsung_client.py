@@ -121,7 +121,7 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remote.send_delays, [0.0])
 
     async def test_send_key_serializes_overlapping_sends(self):
-        # A volume auto-repeat overlapping another button must not interleave on the shared socket.
+        # A held-swipe auto-repeat overlapping another button must not interleave on the shared socket.
         log = []
         client = make_client(FakeRemoteFactory(OrderRecordingRemote(log)))
 

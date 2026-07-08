@@ -34,7 +34,6 @@ from .relay import (
     Command,
     CommandRelay,
     DirectionalHoldConfig,
-    REPEAT_KIND_GESTURE,
     RepeatPhase,
     volume_key_for,
 )
@@ -122,15 +121,12 @@ class BridgeCompanionService(FakeCompanionService):
         self._relay = CommandRelay(
             self._dispatch_sink, gesture_config=gesture_config, hold_config=self._hold_config
         )
-        # Two independent hold-repeat drivers (each owns its own timer/state and cadence):
-        #  - volume: retained but largely inert (iOS doesn't stream hold frames for volume buttons);
-        #  - directional: driven by held swipes. It's stopped authoritatively by the touch release
-        #    (reliable on the live TCP link), by ``_touchStop`` (touch session ended without a release,
-        #    e.g. Control Center dismissed), and by teardown; iOS sends NO frames for a held-but-still
-        #    finger (observed >1.2s gaps mid-hold), so a frame-silence dead-man would cut real holds —
-        #    the max_hold cap is the final runaway backstop instead.
-        self._vol_repeater = HoldRepeater(self._send_repeat_key, loop=self.loop)
-        self._dir_repeater = HoldRepeater(
+        # Single hold-repeat driver, fed by held directional swipes (the only input that streams a
+        # hold). It's stopped authoritatively by the touch release (reliable on the live TCP link), by
+        # ``_touchStop`` (touch session ended without a release, e.g. Control Center dismissed), and by
+        # teardown; iOS sends NO frames for a held-but-still finger (observed >1.2s gaps mid-hold), so a
+        # frame-silence dead-man would cut real holds — the max_hold cap is the final runaway backstop.
+        self._repeater = HoldRepeater(
             self._send_repeat_key,
             loop=self.loop,
             config=HoldRepeatConfig(
@@ -141,12 +137,11 @@ class BridgeCompanionService(FakeCompanionService):
         )
 
     async def _stop_all_repeaters(self) -> None:
-        """Cancel every in-flight hold repeat (both drivers) on teardown/disconnect."""
-        await self._vol_repeater.stop_all()
-        await self._dir_repeater.stop_all()
+        """Cancel any in-flight hold repeat on teardown/disconnect."""
+        await self._repeater.stop_all()
 
     async def _send_repeat_key(self, key: str) -> None:
-        """Send one auto-repeat volume click (fast pacing; the repeater controls cadence)."""
+        """Send one auto-repeat click (fast pacing; the repeater controls cadence)."""
         if self._dispatch is None:
             return
         await self._dispatch(Command(Action.SEND_KEY, key, source="repeat", fast=True))
@@ -303,13 +298,8 @@ class BridgeCompanionService(FakeCompanionService):
             # last level and relay a discrete Samsung step; mirror the level so the slider stays live.
             new = content.get("_vol")
             if isinstance(new, (int, float)):
-                if self._vol_repeater.active:
-                    # A HID volume hold is the authoritative source right now; drop the slider path so
-                    # we don't double-step. (The two shouldn't normally co-occur; guard is defensive.)
-                    _LOGGER.debug("Ignoring SetVolume while a volume hold is active")
-                else:
-                    key, self.state.volume = volume_key_for(self.state.volume, new)
-                    self._relay.emit(Command(Action.SEND_KEY, key, source="mcc:SetVolume"))
+                key, self.state.volume = volume_key_for(self.state.volume, new)
+                self._relay.emit(Command(Action.SEND_KEY, key, source="mcc:SetVolume"))
         elif cmd is MediaControlCommand.GetCaptionSettings:
             # iOS issues GetCaptionSettings during session setup and tears the TV Remote session
             # down ~2-4ms after our reply. An empty dict appears to be rejected; the caption-enabled
@@ -346,10 +336,10 @@ class BridgeCompanionService(FakeCompanionService):
         A per-touch ``release`` normally stops the repeat, but iOS can end the whole touch session
         (Control Center dismissed, phone locked, app backgrounded) without a matching ``release`` while
         the TCP connection stays alive. Treat ``_touchStop`` as an authoritative "finger's gone" so a
-        held-swipe repeat can't run on to the ``max_hold`` cap. Volume isn't touch-driven, so only the
-        directional repeater is stopped; the relay's hold state re-initializes on the next press.
+        held-swipe repeat can't run on to the ``max_hold`` cap; the relay's hold state re-initializes
+        on the next press.
         """
-        self.loop.create_task(self._dir_repeater.stop_all())
+        self.loop.create_task(self._repeater.stop_all())
         self.send_response(message, {})
 
     def handle__tistart(self, message):  # noqa: N802
@@ -507,27 +497,23 @@ class BridgeCompanionService(FakeCompanionService):
         The relay is synchronous (it runs inside a protocol handler); fire the dispatch as a task so
         a slow Samsung call can't block the Companion frame loop.
         """
-        # Hold-repeat control (volume button / held directional swipe). Registered synchronously here,
-        # in frame order, so a release (STOP) can never race ahead of its press (START). START also
-        # fires one guaranteed immediate click as an independent task (never cancelled), so a fast
-        # tap/swipe always yields exactly one step while the repeater drives only the delayed repeats.
+        # Hold-repeat control for a held directional swipe. Registered synchronously here, in frame
+        # order, so a release (STOP) can never race ahead of its press (START). START also fires one
+        # guaranteed immediate click as an independent task (never cancelled), so a fast swipe always
+        # yields exactly one step while the repeater drives only the delayed repeats.
         if command.repeat is RepeatPhase.START:
             _LOGGER.info("Relay hold START (%s)", command.source)
             key = command.samsung_key
             if key is not None:
-                repeater = (self._dir_repeater if command.repeat_kind == REPEAT_KIND_GESTURE
-                            else self._vol_repeater)
                 if self._dispatch is not None:
                     self.loop.create_task(self._safe_dispatch(
                         Command(command.action, key, source=command.source, fast=True)))
-                repeater.start(key)
+                self._repeater.start(key)
             return
         if command.repeat is RepeatPhase.STOP:
             _LOGGER.info("Relay hold STOP (%s)", command.source)
             if command.samsung_key is not None:
-                repeater = (self._dir_repeater if command.repeat_kind == REPEAT_KIND_GESTURE
-                            else self._vol_repeater)
-                repeater.stop(command.samsung_key)
+                self._repeater.stop(command.samsung_key)
             return
         # Text fires per keystroke — keep it at DEBUG so typing doesn't flood the log.
         if command.action is Action.SEND_TEXT:
@@ -582,7 +568,7 @@ def make_samsung_dispatch(client) -> Dispatch:
     """
     async def dispatch(command: Command) -> None:
         if command.action is Action.SEND_KEY and command.samsung_key:
-            # Auto-repeat/first-click volume sends set fast=True so the library's post-send pacing
+            # Auto-repeat/first-click hold sends set fast=True so the library's post-send pacing
             # doesn't stack up; the repeater's own interval controls cadence.
             key_press_delay = 0.0 if command.fast else None
             await client.send_key(command.samsung_key, command.cmd, key_press_delay=key_press_delay)

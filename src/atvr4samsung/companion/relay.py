@@ -14,13 +14,11 @@ from enum import Enum
 from typing import Callable, Optional, Tuple
 
 from ..bridge.gestures import GestureConfig, SwipeTranslator
-from ..bridge.keymap import GESTURE_TO_SAMSUNG, Action, is_repeatable, resolve
+from ..bridge.keymap import GESTURE_TO_SAMSUNG, Action, resolve
 
 _LOGGER = logging.getLogger(__name__)
 
-# Companion button-state values (``_hBtS``): 1 = down/press, 2 = up/release. Most buttons act on
-# release; repeatable buttons (volume) act on both edges to drive the hold-repeat lifecycle.
-_BUTTON_PRESS = 1
+# Companion button-state values (``_hBtS``): 1 = down/press, 2 = up/release. Buttons act on release.
 _BUTTON_RELEASE = 2
 
 # A center tap arrives as BOTH a discrete Select button (``_hidC`` 6) and a touch tap that resolves to
@@ -30,15 +28,10 @@ _SELECT_DEDUPE_MS = 400.0
 
 
 class RepeatPhase(Enum):
-    """Hold lifecycle for a repeatable input (volume button or a held directional swipe)."""
+    """Hold lifecycle for a held directional swipe (the only auto-repeat driver)."""
 
     START = "start"  # hold began — begin the immediate step + auto-repeat
     STOP = "stop"    # hold ended — stop repeating (no key is sent for this phase)
-
-
-# repeat_kind values: which hold driver a START/STOP belongs to (they have independent cadence/state).
-REPEAT_KIND_VOLUME = "volume"
-REPEAT_KIND_GESTURE = "gesture"
 
 
 @dataclass(frozen=True)
@@ -66,8 +59,7 @@ class Command:
     cmd: str = "Click"  # Click / Press / Release
     source: str = ""  # debug provenance, e.g. "button:6" or "gesture:RIGHT"
     text: Optional[str] = None  # full field contents for Action.SEND_TEXT
-    repeat: Optional[RepeatPhase] = None  # hold lifecycle (volume button / held directional swipe)
-    repeat_kind: Optional[str] = None  # REPEAT_KIND_* — which hold driver this START/STOP routes to
+    repeat: Optional[RepeatPhase] = None  # hold lifecycle for a held directional swipe
     fast: bool = False  # bypass the client's post-send pacing so the repeater controls cadence
 
 
@@ -113,22 +105,12 @@ class CommandRelay:
         self._suppress_click_until_press = False   # drop a stray SELECT after a held gesture
 
     def on_button(self, hid_code: int, button_state: int) -> None:
-        """Resolve a ``_hidC`` button and emit it.
+        """Resolve a ``_hidC`` button and emit it once on **release** (matches a discrete click).
 
-        Non-repeatable buttons fire once on **release** (matches a discrete click). Repeatable
-        buttons (volume) emit a hold ``START`` on press and ``STOP`` on release; the async repeater
-        turns that into the immediate step plus auto-repeat. Repeatable buttons are always mapped, so
-        there's no ``UNMAPPED`` case to guard on that path.
+        Presses are ignored; only the release edge fires. Volume Up/Down go through this same path —
+        one discrete ``KEY_VOL*`` step per press — because iOS doesn't stream a hold for them, so
+        there's no auto-repeat lifecycle to drive.
         """
-        if is_repeatable(hid_code):
-            mapping = resolve(hid_code)
-            if button_state == _BUTTON_PRESS:
-                self.emit(Command(mapping.action, mapping.samsung_key, source=f"button:{hid_code}",
-                                  repeat=RepeatPhase.START, repeat_kind=REPEAT_KIND_VOLUME, fast=True))
-            elif button_state == _BUTTON_RELEASE:
-                self.emit(Command(mapping.action, mapping.samsung_key, source=f"button:{hid_code}",
-                                  repeat=RepeatPhase.STOP, repeat_kind=REPEAT_KIND_VOLUME))
-            return
         if button_state != _BUTTON_RELEASE:
             return
         mapping = resolve(hid_code)
@@ -205,7 +187,7 @@ class CommandRelay:
             key = GESTURE_TO_SAMSUNG.get(d)
             if key:
                 self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{d}",
-                                  repeat=RepeatPhase.START, repeat_kind=REPEAT_KIND_GESTURE, fast=True))
+                                  repeat=RepeatPhase.START, fast=True))
                 self._hold_active = True
                 self._hold_was_active = True
 
@@ -215,7 +197,7 @@ class CommandRelay:
             key = GESTURE_TO_SAMSUNG.get(self._hold_dir)
             if key:
                 self.emit(Command(Action.SEND_KEY, key, source=f"gesture:{self._hold_dir}",
-                                  repeat=RepeatPhase.STOP, repeat_kind=REPEAT_KIND_GESTURE))
+                                  repeat=RepeatPhase.STOP))
         self._hold_active = False
 
     def _reset_hold_state(self) -> None:

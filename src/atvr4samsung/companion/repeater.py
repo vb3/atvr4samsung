@@ -1,13 +1,10 @@
 """Hold-to-repeat driver for a held remote key.
 
 While a key is "held", keep sending discrete ``KEY_*`` clicks at a keyboard-style cadence until
-release. Two things drive holds today:
-- **Directional swipes** (LEFT/RIGHT/UP/DOWN): iOS streams real touch frames for the whole hold, so
-  the relay detects the dwell and drives START/STOP — this is the path that actually works.
-- **Volume Up/Down buttons**: iOS Control Center does **not** stream hold frames for these (press and
-  release effectively arrive together regardless of how long you hold), so the button hold never
-  registers as a real hold — this wiring is retained but largely inert. Kept generic here so the same
-  driver serves whichever inputs do provide a hold signal.
+release. The only input that provides a real hold signal is a **directional swipe**
+(LEFT/RIGHT/UP/DOWN): iOS streams touch frames for the whole hold, so the relay detects the dwell and
+drives START/STOP. (CC Volume Up/Down don't qualify — iOS delivers their press and release together
+regardless of how long you hold — so they stay a single discrete step, not a hold.)
 
 Design (see docs/lld.md §4):
 - This component owns **all** repeat state and the **only** timer. The relay stays stateless; the
@@ -78,8 +75,7 @@ class HoldRepeater:
 
     @property
     def active(self) -> bool:
-        """True while a key is being held/repeated (used to suppress conflicting paths, e.g. the
-        volume slider's SetVolume while a volume hold is active)."""
+        """True while a key is being held/repeated (used to suppress conflicting paths)."""
         return bool(self._tasks)
 
     def start(self, key: str) -> None:

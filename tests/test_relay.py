@@ -10,7 +10,6 @@ from atvr4samsung.bridge.keymap import Action
 from atvr4samsung.companion.relay import (
     CommandRelay,
     DirectionalHoldConfig,
-    REPEAT_KIND_GESTURE,
     RepeatPhase,
     volume_key_for,
 )
@@ -65,52 +64,38 @@ class TestButtonDecode(unittest.TestCase):
         self.assertEqual(sink[0].samsung_key, "KEY_PLAY_BACK")
 
 
-class TestVolumeHold(unittest.TestCase):
-    """Volume buttons drive a hold lifecycle: START on press, STOP on release (see repeater.py).
-
-    This differs from every other button (which fires once on release); the relay stays stateless —
-    the timing/cap lives in the async repeater.
+class TestVolumeButtonFallback(unittest.TestCase):
+    """Volume Up/Down have no hold lifecycle — iOS doesn't stream a hold for them — so they behave
+    like every other button: press ignored, one discrete ``KEY_VOL*`` on release, no repeat phase.
     """
 
-    def test_press_emits_start_with_fast_pacing(self):
+    def test_volume_press_is_ignored(self):
         relay, sink, _ = _relay()
         relay.on_button(8, 1)  # VolumeUp press
+        self.assertEqual(sink, [], "no START on press; volume has no hold lifecycle")
+
+    def test_volume_up_release_emits_single_discrete_step(self):
+        relay, sink, _ = _relay()
+        relay.on_button(8, 2)  # VolumeUp release
         self.assertEqual(len(sink), 1)
         cmd = sink[0]
         self.assertEqual(cmd.action, Action.SEND_KEY)
         self.assertEqual(cmd.samsung_key, "KEY_VOLUP")
-        self.assertEqual(cmd.repeat, RepeatPhase.START)
-        self.assertTrue(cmd.fast, "repeat sends bypass the client's post-send pacing")
-        self.assertEqual(cmd.source, "button:8")
-
-    def test_release_emits_stop(self):
-        relay, sink, _ = _relay()
-        relay.on_button(9, 2)  # VolumeDown release
-        self.assertEqual(len(sink), 1)
-        cmd = sink[0]
-        self.assertEqual(cmd.samsung_key, "KEY_VOLDOWN")
-        self.assertEqual(cmd.repeat, RepeatPhase.STOP)
+        self.assertIsNone(cmd.repeat, "no hold lifecycle for volume buttons")
         self.assertFalse(cmd.fast)
 
-    def test_press_then_release_is_start_then_stop(self):
+    def test_volume_down_release_emits_single_discrete_step(self):
         relay, sink, _ = _relay()
-        relay.on_button(8, 1)
-        relay.on_button(8, 2)
-        self.assertEqual([c.repeat for c in sink], [RepeatPhase.START, RepeatPhase.STOP])
+        relay.on_button(9, 2)  # VolumeDown release
+        self.assertEqual([c.samsung_key for c in sink], ["KEY_VOLDOWN"])
+        self.assertIsNone(sink[0].repeat)
+        self.assertFalse(sink[0].fast)
 
     def test_non_volume_button_carries_no_repeat_phase(self):
         relay, sink, _ = _relay()
         relay.on_button(7, 2)  # Home release
         self.assertIsNone(sink[0].repeat)
         self.assertFalse(sink[0].fast)
-
-    def test_volume_press_is_not_ignored_unlike_other_buttons(self):
-        # A non-repeatable press emits nothing; a volume press must emit a START.
-        relay, sink, _ = _relay()
-        relay.on_button(7, 1)  # Home press -> ignored
-        self.assertEqual(sink, [])
-        relay.on_button(8, 1)  # VolumeUp press -> START
-        self.assertEqual(len(sink), 1)
 
 
 class TestSelectDedupe(unittest.TestCase):
@@ -204,7 +189,6 @@ class TestDirectionalHold(unittest.TestCase):
         starts = _starts(sink)
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0].samsung_key, "KEY_RIGHT")
-        self.assertEqual(starts[0].repeat_kind, REPEAT_KIND_GESTURE)
         self.assertTrue(starts[0].fast)
 
     def test_release_after_hold_stops_and_suppresses_discrete(self):

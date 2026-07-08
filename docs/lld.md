@@ -13,14 +13,14 @@ src/atvr4samsung/
   app.py                 console entry point: load config, connect Samsung, serve Companion, advertise mDNS
   config.py              typed config (dataclasses); PyYAML imported lazily so the cores test without it
   bridge/
-    keymap.py            Apple _hidC button code -> Samsung KEY_* mapping (incl. play/pause toggle, repeatable set)  (pure)
+    keymap.py            Apple _hidC button code -> Samsung KEY_* mapping (incl. play/pause toggle)  (pure)
     gestures.py          _hidT touch points -> discrete swipe/tap direction state machine     (pure)
   samsung/
     client.py            async Samsung Frame WebSocket client (samsungtvws) + Wake-on-LAN
   companion/
     server.py            BridgeCompanionService: subclass of the base server that relays to Samsung
-    relay.py             pure decode layer: button/touch -> Command (incl. volume hold START/STOP)   (pure)
-    repeater.py          HoldRepeater: async hold-to-repeat driver (held swipe direction / volume)
+    relay.py             pure decode layer: button/touch -> Command (incl. swipe-hold START/STOP)   (pure)
+    repeater.py          HoldRepeater: async hold-to-repeat driver (held swipe direction)
     discovery.py         mDNS advert of _companion-link._tcp; CompanionAdvertiser re-advertises on IP change
     protocol/            first-party Companion Link implementation (derived from pyatv v0.18.0, MIT)
       appletv.py         base FakeCompanionService: framing, dispatch, HID/touch decode, session handlers
@@ -70,10 +70,10 @@ overrides handlers to relay decoded commands. Notable overrides:
   with binary `deviceCapabilitiesV2` bplists that trip the OPACK UTF-8 assumption) and **closes the
   connection on a ChaCha decrypt failure** so the client re-pairs.
 - `handle__hidc` — decode `{_hBtS, _hidC}` button frames; resolve via `bridge/keymap.resolve()` and
-  dispatch. Most buttons act on **release** (`_hBtS=2`) and de-dupe a SELECT that double-fires within
-  400 ms (a center tap arrives as both a discrete Select and a touch click). **Repeatable buttons
-  (volume, `keymap.is_repeatable`) act on both edges** to drive hold-to-repeat: press emits a
-  `RepeatPhase.START`, release a `STOP` (see §4 and `companion/repeater.py`). The **Siri/mic button**
+  dispatch. Buttons act on **release** (`_hBtS=2`) and de-dupe a SELECT that double-fires within
+  400 ms (a center tap arrives as both a discrete Select and a touch click). Volume Up/Down go through
+  this same release path — one discrete `KEY_VOL*` step per press — because iOS doesn't stream a hold
+  for them (§4). The **Siri/mic button**
   (`_hidC` 10) is acked with an empty response and ignored — a real Apple TV opens a voice-capture
   session we have no audio path to relay; it's dropped from the pressed-button set so it can't wedge
   state. (Prior to v0.8.2 it fell through to a per-tap `Unhandled command` warning with no ack.)
@@ -88,19 +88,19 @@ overrides handlers to relay decoded commands. Notable overrides:
 - `handle_tvrcsessionstart` / `handle_fetchmediacontrolstatus` / `handle__interest` — advertise media
   control (see §5).
 - `handle_mediacontrolcommand` — iOS-26 `MediaControlCommand` flow (GetVolume/SetVolume/captions).
-  The SetVolume (slider) step is **suppressed while a HID volume hold is active**
-  (`_vol_repeater.active`) so the two volume paths can't double-step (§4).
+  A SetVolume (slider/button) level is compared to our last level and relayed as one discrete Samsung
+  step; the level is mirrored back so the slider stays live (§4).
 - `handle__tistart` — establish the RTI text-input session and register as an RTI client, but reply
   **unfocused** so iOS doesn't pop the keyboard on connect; focus is driven later by the TV's IME.
 - `handle__tic` — decode the iOS text operation (insert / `deletionCount` backspace / `textToAssert`
   replace), rebuild the full field string, and forward it to `client.send_text` (deduped). iOS does
   **not** echo our RTI session UUID, so we don't gate on it. See §9.
-- `connection_lost` — cancel any in-flight volume repeat (`_repeater.stop_all()`, safety) and drop our
+- `connection_lost` — cancel any in-flight hold repeat (`_repeater.stop_all()`, safety) and drop our
   RTI-client registration (the base only clears `clients`), then defer to the base.
 
 `make_samsung_dispatch(client)` builds the async dispatch that turns a resolved `Command` into a
 Samsung call (`send_key`, `send_text`, `power_off`, `wake`). Play/pause is just a `send_key`
-(`KEY_PLAY_BACK`), so the dispatch holds no toggle state. A `Command` with `fast=True` (volume
+(`KEY_PLAY_BACK`), so the dispatch holds no toggle state. A `Command` with `fast=True` (held-swipe
 repeat/first-click) sends with `key_press_delay=0` so samsungtvws' post-send pacing doesn't stack up
 and the repeater's own cadence controls the rate.
 `make_ime_focus_handler(state)` mirrors the TV's `ms.remote.imeStart`/`imeEnd` to RTI focus so the
@@ -116,8 +116,8 @@ iPhone keyboard appears only when a TV text field is focused.
 | 5 | Menu | `KEY_RETURN` | Menu = Back |
 | 6 | Select | `KEY_ENTER` | de-duped vs touch tap |
 | 7 | Home | `KEY_HOME` | |
-| 8 | Volume Up | `KEY_VOLUP` | iOS-26 CC volume; **hold-to-repeat** (see below) |
-| 9 | Volume Down | `KEY_VOLDOWN` | iOS-26 CC volume; **hold-to-repeat** (see below) |
+| 8 | Volume Up | `KEY_VOLUP` | iOS-26 CC volume; one discrete step per press |
+| 9 | Volume Down | `KEY_VOLDOWN` | iOS-26 CC volume; one discrete step per press |
 | 14 | Play/Pause | `KEY_PLAY_BACK` | single stateless play/pause toggle (confirmed on the Frame) |
 | **18** | **Mute** (CC) | `KEY_MUTE` | iOS-26 CC Mute wire code is 18 (raw HID `PageUp`) — `AppleButton.Mute = 18` |
 | **19** | **Power** (CC) | `KEY_POWER` | iOS-26 CC Power wire code is 19 (raw HID `PageDown`) — `AppleButton.Power = 19` |
@@ -145,42 +145,40 @@ supersedes the earlier belief that `KEY_PLAY_BACK` was invalid + a `PlayPauseTog
 (verified on the Frame), so don't use it.
 
 **Hold-to-repeat — `companion/repeater.py` `HoldRepeater`:** a held input keeps stepping a key,
-keyboard-style, until release. One generic async driver serves two inputs (each with its own instance,
-cadence, and state):
+keyboard-style, until release. One async driver, fed by held **directional swipes** — the only input
+that provides a real hold signal:
 
-- **Directional swipe (the path that works).** A swipe held past `activate_ms` (**~400 ms** dwell)
-  starts auto-repeating that direction (LEFT/RIGHT/UP/DOWN) — useful for scrubbing a timeline. The
-  relay owns the dwell FSM (`bridge/gestures.SwipeTranslator.current_direction()` classifies the
-  in-progress press→last displacement; shares the axis/threshold helper with the discrete `_resolve`
-  so they never disagree). On dwell it emits `Command(repeat=RepeatPhase.START, repeat_kind="gesture",
-  fast=True)`; release / reversal / return-to-center emits STOP. A quick swipe never trips the dwell,
-  so its tuned discrete behavior is unchanged, and a held gesture's discrete swipe/tap is **suppressed**
-  so it can't double-fire.
-- **Volume Up/Down (retained but largely inert).** The original design assumed iOS sends a held CC
-  volume button as a single HID `_hidC` 8/9 down + delayed up. On-device this doesn't hold: iOS
-  effectively sends press+release together regardless of hold, so the button hold never registers —
-  the wiring stays (generic, harmless) but doesn't repeat in practice.
+- A swipe held past `activate_ms` (**~400 ms** dwell) starts auto-repeating that direction
+  (LEFT/RIGHT/UP/DOWN) — useful for scrubbing a timeline. The relay owns the dwell FSM
+  (`bridge/gestures.SwipeTranslator.current_direction()` classifies the in-progress press→last
+  displacement; shares the axis/threshold helper with the discrete `_resolve` so they never disagree).
+  On dwell it emits `Command(repeat=RepeatPhase.START, fast=True)`; release / reversal /
+  return-to-center emits STOP. A quick swipe never trips the dwell, so its tuned discrete behavior is
+  unchanged, and a held gesture's discrete swipe/tap is **suppressed** so it can't double-fire.
+- **CC Volume Up/Down don't qualify.** iOS effectively sends a held CC volume button as press+release
+  together regardless of how long you hold, so there's no hold to detect — volume is always one
+  discrete step per press (handled on the button/SetVolume paths, not here). An earlier design wired a
+  second volume repeater; it never fired on-device and was removed.
 
-Mechanics (shared):
+Mechanics:
 - The relay is **stateless for buttons** / owns only the touch dwell FSM; `_dispatch_sink` handles
-  START/STOP **synchronously** in frame order (a release can't race ahead of its press) and routes by
-  `repeat_kind` to the volume vs directional `HoldRepeater`. START fires **one guaranteed immediate
-  click** as an independent, uncancellable task (so a fast tap/swipe always yields exactly one step),
-  then `repeater.start(key)` drives only the delayed repeats.
+  START/STOP **synchronously** in frame order (a release can't race ahead of its press) and drives the
+  single `HoldRepeater`. START fires **one guaranteed immediate click** as an independent, uncancellable
+  task (so a fast swipe always yields exactly one step), then `repeater.start(key)` drives only the
+  delayed repeats.
 - `HoldRepeater` owns the **only** timer and all hold state: after the immediate click it waits
   `initial_delay` then repeats every `interval`, hard-capped at `max_hold`. Only one direction repeats
-  at a time (starting one cancels the other). Directional cadence: `initial_delay` **0.25 s**,
-  `interval` **0.12 s**, `max_hold` **15 s** (`DirectionalHoldConfig`, code constants — not
-  `config.yaml`). It also accepts an optional `should_continue` liveness gate (generic; **unused** for
-  directional — see the stop model below).
-- **Stopping a directional hold (no frame-based dead-man).** iOS sends **no touch frames for a
-  held-but-still finger** — observed >1.2 s gaps mid-hold — so a frame-silence dead-man would cut real
-  holds (and couldn't tell a still finger from a lost release: both are silent). Instead the repeat is
-  stopped by the touch **`release`** (reliable on the live TCP link; `handle__hidt` fails closed so a
-  malformed release still drives a STOP), by **`_touchStop`** (touch session ended without a release —
-  Control Center dismissed / phone locked / backgrounded), and by teardown (`connection_lost` /
-  `TVRCSessionStop` → `stop_all()`). `max_hold` (15 s) is the final runaway backstop. While a **volume**
-  hold is active the SetVolume slider path is suppressed so the two volume sources can't double-step.
+  at a time (starting one cancels the other). Cadence: `initial_delay` **0.25 s**, `interval`
+  **0.12 s**, `max_hold` **15 s** (`DirectionalHoldConfig`, code constants — not `config.yaml`). It
+  also accepts an optional `should_continue` liveness gate (generic; **unused** today — see the stop
+  model below).
+- **Stopping a hold (no frame-based dead-man).** iOS sends **no touch frames for a held-but-still
+  finger** — observed >1.2 s gaps mid-hold — so a frame-silence dead-man would cut real holds (and
+  couldn't tell a still finger from a lost release: both are silent). Instead the repeat is stopped by
+  the touch **`release`** (reliable on the live TCP link; `handle__hidt` fails closed so a malformed
+  release still drives a STOP), by **`_touchStop`** (touch session ended without a release — Control
+  Center dismissed / phone locked / backgrounded), and by teardown (`connection_lost` /
+  `TVRCSessionStop` → `stop_all()`). `max_hold` (15 s) is the final runaway backstop.
 - **Fails closed:** a send error ends the loop (no hammering); repeat sends use `key_press_delay=0`
   (`Command.fast`) and are serialized with every other key send by the client's `_send_lock` on the one
   shared websocket.
@@ -218,8 +216,8 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   TV 4K:** `FetchMediaControlStatus → {"MediaControlFlags": 256}`; the `_iMC` event → `{"_mcF": 256}`.
   So the server answers `FetchMediaControlStatus` and pushes `MediaControlStatus` with
   `{"MediaControlFlags": 256}` (and still sends the legacy `_iMC` with `_mcF` for pyatv-style
-  clients). iOS 26 then sends volume as HID `_hidC` 8/9 and Mute as 18. Holding Volume Up/Down
-  auto-repeats the step — see §4 "Volume hold-to-repeat".
+  clients). iOS 26 then sends volume as HID `_hidC` 8/9 and Mute as 18 — each a single discrete step
+  per press (iOS doesn't stream a hold for the CC volume buttons; see §4).
 - **The `receivedSiriSettings`/`receivedVolumeSettings` flags** only decide *when* the supported-button
   set is recomputed (a 300 ms fallback force-sets both locally on the phone). They are why Siri and
   Volume appear to "light up together" on a real ATV — one `deviceUpdatedSupportedButtons` callback —

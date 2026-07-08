@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.10.1] - 2026-07-07
+
+### Removed
+
+- **Volume hold-to-repeat wiring (was inert).** iOS doesn't stream hold frames for the CC Volume
+  Up/Down buttons (press+release arrive together regardless of hold), so that path never activated.
+  Removed it: the keymap "repeatable buttons" set (`REPEATABLE_BUTTONS`/`is_repeatable`), the relay's
+  volume START/STOP branch, the dedicated `_vol_repeater`, and the SetVolume-suppression guard. Volume
+  Up/Down now go through the normal path — one discrete `KEY_VOL*` step per press (unchanged for the
+  user). Discrete volume via the CC slider (`SetVolume`) is untouched.
+
+### Changed
+
+- **Collapsed the hold-repeat routing to a single driver.** With the directional swipe as the only
+  hold input, dropped the two-kind routing (`repeat_kind`, `REPEAT_KIND_*`, `Command.repeat_kind`) and
+  the two-repeater split; the server now owns one `HoldRepeater`. No behavior change to any working
+  path.
+
 ## [0.10.0] - 2026-07-07
 
 ### Added
