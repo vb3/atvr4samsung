@@ -153,5 +153,5 @@ jobs:
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             echo "Deleting release + tag: $tag"
-            gh release delete "$tag" --cleanup-tag --yes
+            python scripts/delete_release.py "$tag"
           done <<< "$STALE"

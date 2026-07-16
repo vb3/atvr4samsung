@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.11.1] - 2026-07-16
+
+### Fixed
+
+- Release pruning now retries transient `gh release delete --cleanup-tag` failures with bounded
+  backoff and fails closed after the final attempt, avoiding orphaned releases during GitHub API
+  outages.
+
 ## [0.11.0] - 2026-07-16
 
 ### Changed
