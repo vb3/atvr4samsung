@@ -1,6 +1,9 @@
 """Unit tests for Samsung client seams: no TV libraries, hardware, or network."""
 import asyncio
+import sys
+from types import ModuleType
 import unittest
+from unittest.mock import patch
 
 from atvr4samsung.samsung.client import (
     SamsungFrameClient,
@@ -191,6 +194,25 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
         client.wake()
 
         self.assertEqual(calls, [MAC])
+
+    def test_wake_uses_wakeonlan_v4_api_with_configured_destination(self):
+        calls = []
+        fake_wakeonlan = ModuleType("wakeonlan")
+
+        def fake_wake(*macs, **kwargs):
+            calls.append((macs, kwargs))
+
+        fake_wakeonlan.wake = fake_wake
+        client = make_client(
+            FakeRemoteFactory(),
+            wol_broadcast="192.0.2.255",
+            wol_port=7,
+        )
+
+        with patch.dict(sys.modules, {"wakeonlan": fake_wakeonlan}):
+            client.wake()
+
+        self.assertEqual(calls, [((MAC,), {"host": "192.0.2.255", "port": 7})])
 
     def test_default_key_press_delay_is_responsive(self):
         # Snappier than samsungtvws' 1s default, while still pacing the TV between rapid presses.

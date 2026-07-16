@@ -203,9 +203,9 @@ class SamsungFrameClient:
             self._wol_sender(self.mac)
             return
 
-        from wakeonlan import send_magic_packet
+        from wakeonlan import wake
 
-        send_magic_packet(self.mac, ip_address=self.wol_broadcast, port=self.wol_port)
+        wake(self.mac, host=self.wol_broadcast, port=self.wol_port)
 
     async def connect(self) -> "SamsungFrameClient":
         if self.token_file:

@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [0.11.0] - 2026-07-16
+
+### Changed
+
+- Raised the `samsungtvws` minimum to 3.0.5, matching the text-input APIs used by the bridge.
+- Migrated Wake-on-LAN to `wakeonlan` 4.0's `wake()` API and raised its minimum accordingly.
+
 ## [0.10.1] - 2026-07-07
 
 ### Removed
