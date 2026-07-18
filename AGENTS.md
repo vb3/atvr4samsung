@@ -16,7 +16,7 @@ these.)
 
 ## What this project is (one paragraph)
 
-A small always-on service (target: Raspberry Pi 4 on the IoT VLAN) that **emulates an Apple TV** so
+A small always-on Linux container (Raspberry Pi 4 is the reference host) that **emulates an Apple TV** so
 the iPhone's native Control Center remote pairs with it over **Companion Link**, then **relays each
 decoded command to a Samsung Frame TV** via its local WebSocket API. The Apple-side server is
 a first-party Companion Link impl (`companion/protocol/`, derived from pyatv, MIT) and hardened; the Samsung side uses
@@ -130,8 +130,8 @@ The code should read for itself; comments earn their place by adding what the co
 - **Bump the version every commit.** Increment `version` in `pyproject.toml` on each commit — patch
   level for routine changes, minor/major per semver for features/breaking changes. It is the single
   source of truth; `src/atvr4samsung/__init__.py` derives `__version__` from package metadata, so
-  only `pyproject.toml` changes. A minor/major bump (`X.Y.0`) triggers the release workflow to build
-  + publish a wheel; routine patch bumps don't.
+  only `pyproject.toml` changes. Every strictly newer stable version publishes the multi-platform OCI
+  image and deployment bundle.
 - Update `docs/hld.md` / `docs/lld.md` / `docs/operations.md` when the design, protocol, mappings, or
   ops change (see "Keep the docs current" above); update this file when a convention changes.
 - Co-author trailer for AI-assisted commits is fine; never put secrets in commit messages.
@@ -148,7 +148,9 @@ src/atvr4samsung/
   samsung/client.py    # async Samsung Frame control client + Wake-on-LAN
   companion/server.py  # emulated Apple TV bridge (subclasses companion/protocol/appletv.py)
 companion/protocol/    # first-party Companion Link impl (opack, auth, appletv) — edit freely
-scripts/               # install.sh — pipx + systemd installer
+deploy/                # Compose model, container config template, deployment manager
+scripts/               # deterministic container bundle + release decision/artifact checks
+Dockerfile             # locked multi-stage amd64/arm64 production image
 tests/                 # stdlib-runnable unit tests for the pure layers
 docs/hld.md            # high-level design (architecture, decisions)
 docs/lld.md            # low-level design (modules, wire protocol, iOS-26 capability gates, mappings)

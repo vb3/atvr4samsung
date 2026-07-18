@@ -13,12 +13,8 @@ from contextlib import AsyncExitStack
 import logging
 import os
 import pathlib
-import pwd
-import re
-import shutil
 import signal
 import socket
-import sys
 from datetime import datetime
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypeVar
 
@@ -37,12 +33,11 @@ except Exception:  # not installed as a distribution (bare source tree)
     __version__ = "0.0.0+unknown"
 
 # Default config location (XDG-style). The CLI uses this when --config is omitted so `run`/`init`/
-# `--check`/`install-service`/`trust-tv`/`pair` all agree with the installer and docs.
+# `--check`/`trust-tv`/`pair` all agree.
 DEFAULT_CONFIG_PATH = "~/.config/atvr4samsung/config.yaml"
 
 _LOGGER = logging.getLogger(__name__)
 _ListenerResult = TypeVar("_ListenerResult")
-_SYSTEMD_ACCOUNT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 
 
 def _detect_local_ip(target_host: str) -> str:
@@ -302,165 +297,6 @@ def _cmd_init(path: str) -> int:
     return 0
 
 
-def _per_user_service_owner() -> Optional[str]:
-    """Return the current unprivileged account for the bundled per-user unit."""
-    effective_uid = os.geteuid()
-    if effective_uid == 0:
-        print(
-            "error: do not run `atvr4samsung install-service` with sudo or as root. "
-            "Run it as the normal target user; `--apply` requests sudo only for the narrow "
-            "systemd installation steps. For a dedicated system user, adapt "
-            "systemd/atvr4samsung.service instead."
-        )
-        return None
-    try:
-        account = pwd.getpwuid(effective_uid)
-    except KeyError:
-        print(
-            "error: could not resolve the current account through passwd; refusing to generate a "
-            "per-user service."
-        )
-        return None
-    user = account.pw_name
-    if (
-        not isinstance(getattr(account, "pw_uid", None), int)
-        or account.pw_uid != effective_uid
-        or account.pw_uid == 0
-    ):
-        print(
-            "error: passwd did not return the current unprivileged account; refusing to write "
-            "a User= directive."
-        )
-        return None
-    if user == "root":
-        print(
-            "error: refusing to generate a per-user service for root. Run as the normal target user, "
-            "or adapt systemd/atvr4samsung.service for a dedicated system user."
-        )
-        return None
-    if not isinstance(user, str) or not _SYSTEMD_ACCOUNT_NAME.fullmatch(user):
-        print(
-            "error: passwd returned an invalid per-user service account name; refusing to write "
-            "a User= directive."
-        )
-        return None
-    return user
-
-
-def _systemd_exec_quote(argument: str) -> str:
-    """Encode one literal argument using systemd.exec's command-line grammar."""
-    if not isinstance(argument, str):
-        raise ValueError("systemd command arguments must be text")
-    if any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in argument):
-        raise ValueError("systemd command arguments must not contain control characters")
-    if argument == ";":
-        return r"\;"
-    return (
-        '"'
-        + argument.replace("\\", "\\\\").replace('"', r'\"').replace("%", "%%").replace("$", "$$")
-        + '"'
-    )
-
-
-def _service_exec_argv(config_path: str) -> list[str]:
-    """Build the direct argv that the generated systemd unit must execute."""
-    executable = shutil.which("atvr4samsung")
-    if executable:
-        argv = [str(pathlib.Path(executable).resolve())]
-    else:
-        argv = [str(pathlib.Path(sys.executable).resolve()), "-m", "atvr4samsung.app"]
-    argv.extend(("--config", str(pathlib.Path(config_path).expanduser().resolve())))
-    return argv
-
-
-def _cmd_install_service(config_path: str, apply: bool = False) -> int:
-    user = _per_user_service_owner()
-    if user is None:
-        return 1
-    if apply and not _service_start_prerequisites_ready(config_path):
-        return 1
-
-    try:
-        exec_start = " ".join(_systemd_exec_quote(argument) for argument in _service_exec_argv(config_path))
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        print(f"error: refusing to generate an unsafe systemd ExecStart: {exc}.")
-        return 1
-    # Hardening compatible with a per-user, home-based config/state install. We deliberately do NOT set
-    # ProtectHome / ProtectSystem=strict here because config (~/.config) and pairing state
-    # (~/.local/state) live under $HOME; the hardened system-wide alternative is
-    # systemd/atvr4samsung.service. AF_NETLINK is required for mDNS; AF_INET(6) for Companion + WoL.
-    unit = f"""[Unit]
-Description=atvr4samsung (emulated Apple TV -> Samsung Frame TV)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User={user}
-ExecStart={exec_start}
-Restart=on-failure
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target
-"""
-    if apply:
-        import subprocess
-        try:
-            subprocess.run(["sudo", "tee", "/etc/systemd/system/atvr4samsung.service"],
-                           input=unit, text=True, check=True, stdout=subprocess.DEVNULL)
-            subprocess.run(["sudo", "systemctl", "daemon-reload"], check=True)
-            subprocess.run(["sudo", "systemctl", "enable", "--now", "atvr4samsung"], check=True)
-            print("Installed + started atvr4samsung.service. Logs: journalctl -u atvr4samsung -f")
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            print(f"error: could not install service ({exc}); re-run with sudo available.")
-            return 1
-        return 0
-    print("Install with:\n")
-    print(f"  sudo tee /etc/systemd/system/atvr4samsung.service >/dev/null <<'EOF'\n{unit}EOF")
-    print("  sudo systemctl daemon-reload && sudo systemctl enable --now atvr4samsung")
-    return 0
-
-
-def _service_start_prerequisites_ready(config_path: str) -> bool:
-    """Require a valid config and explicit Samsung certificate pin before privileged service startup."""
-    try:
-        config = load_config(config_path)
-    except (FileNotFoundError, OSError, ValueError) as exc:
-        print(f"error: cannot install/start the service: {exc}")
-        print("Fix the config, run `atvr4samsung --check`, then approve the TV with `atvr4samsung trust-tv`.")
-        return False
-
-    tls_pin = config.samsung_tls_certificate_file
-    if tls_pin is None:
-        print("error: cannot install/start the service: companion.state_dir is required for the Samsung TLS pin.")
-        print("Set companion.state_dir, then run `atvr4samsung trust-tv` to approve the TV certificate.")
-        return False
-
-    from .samsung.trust import SamsungTlsTrustError, load_trusted_certificate
-
-    try:
-        load_trusted_certificate(tls_pin)
-    except SamsungTlsTrustError as exc:
-        print(f"error: cannot install/start the service: Samsung TLS trust is not ready ({exc}).")
-        print(
-            "Run `atvr4samsung trust-tv`, inspect its SHA-256, then rerun "
-            "`atvr4samsung trust-tv --approve-sha256 <fingerprint>` before applying the service."
-        )
-        return False
-    return True
-
-
 def _probe_bind(port: int) -> tuple[bool, str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -595,6 +431,29 @@ async def _cmd_doctor(config: Config) -> int:
         print("Problems found (FAIL above). Fix them, then re-run `atvr4samsung doctor`.")
         return 1
     print("All checks passed (warnings are non-fatal). Ready to run.")
+    return 0
+
+
+def _cmd_healthcheck(config: Config, *, timeout: float = 2.0) -> int:
+    """Validate persistent trust and confirm the local Companion listener accepts TCP."""
+    if config.companion.port == 0:
+        print("error: healthcheck requires a fixed companion.port")
+        return 1
+    tls_pin = config.samsung_tls_certificate_file
+    if tls_pin is None:
+        print("error: healthcheck requires companion.state_dir")
+        return 1
+
+    from .samsung.trust import SamsungTlsTrustError, load_trusted_certificate
+
+    try:
+        load_trusted_certificate(tls_pin)
+        with socket.create_connection(("127.0.0.1", config.companion.port), timeout=timeout):
+            pass
+    except (OSError, SamsungTlsTrustError) as exc:
+        print(f"error: healthcheck failed: {exc}")
+        return 1
+    print("healthy")
     return 0
 
 
@@ -835,8 +694,6 @@ def main() -> int:
                         help=f"path to config.yaml (default: {DEFAULT_CONFIG_PATH})")
     parser.add_argument("--check", action="store_true",
                         help="validate config and print resolved settings, then exit (no network)")
-    parser.add_argument("--apply", action="store_true",
-                        help="with install-service: actually write + enable the unit (uses sudo)")
     parser.add_argument("--reset-identity", action="store_true",
                         help="with unpair: reset the Apple TV identity through a crash-safe checkpoint "
                              "(restart the service, then forget and re-pair the iPhone)")
@@ -847,11 +704,11 @@ def main() -> int:
         help="with trust-tv: exact SHA-256 fingerprint to approve and persist as the TV TLS pin",
     )
     parser.add_argument("command", nargs="?",
-                        choices=["run", "init", "install-service", "doctor", "trust-tv", "pair", "pairs",
+                        choices=["run", "init", "doctor", "healthcheck", "trust-tv", "pair", "pairs",
                                  "revoke", "unpair"],
                         default="run",
-                        help="run (default), init config, print a systemd unit, doctor "
-                             "(network preflight), trust-tv (review/approve the Samsung TLS pin), "
+                        help="run (default), init config, doctor (network preflight), healthcheck "
+                             "(local listener readiness), trust-tv (review/approve the Samsung TLS pin), "
                              "pair (open enrollment), pairs (list devices), revoke <identifier>, "
                              "or unpair (clear all devices)")
     parser.add_argument("identifier", nargs="?", help="with revoke: exact paired-device identifier")
@@ -861,8 +718,6 @@ def main() -> int:
 
     if args.command == "init":
         return _cmd_init(args.config)
-    if args.command == "install-service":
-        return _cmd_install_service(args.config, apply=args.apply)
     if args.identifier and args.command != "revoke":
         parser.error("a paired-device identifier is only valid with `revoke`")
     if args.approve_sha256 and args.command != "trust-tv":
@@ -884,6 +739,8 @@ def main() -> int:
 
     if args.command == "doctor":
         return asyncio.run(_cmd_doctor(config))
+    if args.command == "healthcheck":
+        return _cmd_healthcheck(config)
     if args.command == "trust-tv":
         return _cmd_trust_tv(config, approved_sha256=args.approve_sha256)
     if args.command == "pair":
@@ -899,7 +756,7 @@ def main() -> int:
         asyncio.run(run(config))
     except KeyboardInterrupt:
         pass
-    except Exception as exc:  # don't dump a raw traceback at an operator; systemd sees the non-zero exit
+    except Exception as exc:  # don't dump a raw traceback at an operator; the supervisor sees non-zero
         _LOGGER.error("Bridge stopped with an error: %s", exc)
         _LOGGER.debug("Fatal error detail", exc_info=True)
         return 1

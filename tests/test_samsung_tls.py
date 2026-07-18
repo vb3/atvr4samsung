@@ -8,7 +8,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import pwd
 import shutil
 import ssl
 import unittest
@@ -313,69 +312,6 @@ class TestDoctorStateSetup(_ProjectScratch, unittest.IsolatedAsyncioTestCase):
             (state_dir / "server-identity.json").stat().st_mode & 0o777,
             0o600,
         )
-
-
-class TestInstallServiceTrustGate(_ProjectScratch, unittest.TestCase):
-    """`install-service --apply` must validate trust before it can invoke sudo/systemctl."""
-
-    def _write_config(self) -> tuple[Path, Path]:
-        state_dir = self.scratch / "state"
-        config_path = self.scratch / "config.yaml"
-        config_path.write_text(
-            "companion:\n"
-            f"  state_dir: {state_dir}\n"
-            "samsung:\n"
-            '  host: "192.0.2.10"\n'
-            '  mac: "AA:BB:CC:DD:EE:FF"\n',
-            encoding="utf-8",
-        )
-        return config_path, state_dir
-
-    def _apply(self, config_path: Path):
-        output = io.StringIO()
-        with (
-            patch("subprocess.run") as run,
-            contextlib.redirect_stdout(output),
-        ):
-            result = app._cmd_install_service(str(config_path), apply=True)
-        return result, output.getvalue(), run
-
-    def test_apply_does_not_run_privileged_commands_without_the_tls_pin(self):
-        config_path, _ = self._write_config()
-
-        result, output, run = self._apply(config_path)
-
-        self.assertEqual(result, 1)
-        run.assert_not_called()
-        self.assertIn("trust-tv", output)
-        self.assertNotIn("Installed + started", output)
-
-    def test_apply_does_not_run_privileged_commands_with_an_unsafe_tls_pin(self):
-        config_path, state_dir = self._write_config()
-        pin = trust_file_for_state_dir(state_dir)
-        pin.parent.mkdir(parents=True, mode=0o700)
-        pin.parent.chmod(0o700)
-        pin.write_text(_CERTIFICATE.pem, encoding="ascii")
-        pin.chmod(0o644)
-
-        result, output, run = self._apply(config_path)
-
-        self.assertEqual(result, 1)
-        run.assert_not_called()
-        self.assertIn("mode 0600", output)
-        self.assertIn("trust-tv", output)
-
-    def test_apply_runs_and_reports_success_only_after_a_valid_tls_pin(self):
-        config_path, state_dir = self._write_config()
-        persist_trusted_certificate(trust_file_for_state_dir(state_dir), _CERTIFICATE)
-
-        result, output, run = self._apply(config_path)
-
-        self.assertEqual(result, 0)
-        self.assertEqual(run.call_count, 3)
-        current_user = pwd.getpwuid(os.geteuid()).pw_name
-        self.assertIn(f"User={current_user}", run.call_args_list[0].kwargs["input"])
-        self.assertIn("Installed + started atvr4samsung.service", output)
 
 
 class TestWebsocketsRuntimeCompatibility(unittest.TestCase):

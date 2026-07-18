@@ -153,7 +153,7 @@ wheels = [
 
 [[package]]
 name = "atvr4samsung"
-version = "1.1.0"
+version = "2.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "chacha20poly1305-reuseable" },
@@ -183,12 +183,12 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "samsungtvws", extras = ["async"], specifier = ">=3.0.5" },
-    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=77" },
+    { name = "setuptools", marker = "extra == 'dev'", specifier = "==83.0.0" },
     { name = "srptools", specifier = ">=1.0" },
     { name = "twine", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "wakeonlan", specifier = ">=4.0.0" },
     { name = "websockets", specifier = ">=15" },
-    { name = "wheel", marker = "extra == 'dev'", specifier = ">=0.42" },
+    { name = "wheel", marker = "extra == 'dev'", specifier = "==0.47.0" },
     { name = "zeroconf", specifier = ">=0.130" },
 ]
 provides-extras = ["dev"]

@@ -15,7 +15,6 @@ jobs:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          # The eb4efd9 compatibility subprocess executes the actual baseline marker contract.
           fetch-depth: 0
       # actions/setup-python v5.6.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -25,42 +24,42 @@ jobs:
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
         with:
           version: "0.11.16"
-          # SHA-256 of astral-sh/uv 0.11.16's uv-x86_64-unknown-linux-gnu.tar.gz.
           checksum: "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
+
       - name: Install
         run: uv sync --all-extras --locked
+
       - name: Test
         run: uv run --frozen --no-sync python -m pytest -q
-      - name: Validate secure release assets
+
+      - name: Validate package and deployment bundle
         run: |
           set -euo pipefail
-          bash -n scripts/install.sh scripts/build.sh
+          bash -n deploy/atvr4samsung-deploy
           rm -rf .release-validation
           trap 'rm -rf .release-validation' EXIT
-          mkdir -p .release-validation/dist
-          VERSION="$(python -I -S -c "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])" < pyproject.toml)"
-          LOCK_VERSION="${VERSION//./-}"
-          uv run --frozen --no-sync python -m build --no-isolation --outdir .release-validation/dist
-          uv export \
-            --quiet \
-            --locked \
-            --no-dev \
-            --no-emit-project \
-            --no-emit-local \
-            --no-sources \
-            --no-build \
-            --format pylock.toml \
-            --output-file ".release-validation/dist/pylock.atvr4samsung-${LOCK_VERSION}.toml"
-          uv run --frozen --no-sync python -I -S scripts/release_assets.py \
-            --version "${VERSION}" \
-            --dist-dir .release-validation/dist
-          uv run --frozen --no-sync python -I -S scripts/release_assets.py \
-            --verify \
-            --version "${VERSION}" \
-            --dist-dir .release-validation/dist
+          mkdir -p .release-validation/package .release-validation/dist
+          VERSION="$(
+            python -I -S -c \
+              "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])" \
+              < pyproject.toml
+          )"
+          uv run --frozen --no-sync python -m build \
+            --no-isolation \
+            --outdir .release-validation/package
+          uv run --frozen --no-sync python -m twine check \
+            ".release-validation/package/atvr4samsung-${VERSION}-py3-none-any.whl" \
+            ".release-validation/package/atvr4samsung-${VERSION}.tar.gz"
           uv run --frozen --no-sync python -I -S scripts/verify_artifacts.py \
-            ".release-validation/dist/atvr4samsung-${VERSION}-py3-none-any.whl" \
-            ".release-validation/dist/atvr4samsung-${VERSION}.tar.gz"
+            ".release-validation/package/atvr4samsung-${VERSION}-py3-none-any.whl" \
+            ".release-validation/package/atvr4samsung-${VERSION}.tar.gz"
+          uv run --frozen --no-sync python -I -S scripts/container_bundle.py \
+            --version "$VERSION" \
+            --output-dir .release-validation/dist
+          uv run --frozen --no-sync python -I -S scripts/container_bundle.py \
+            --verify \
+            --version "$VERSION" \
+            --output-dir .release-validation/dist
           uv run --frozen --no-sync python - <<'PY'
           from pathlib import Path
           import yaml
@@ -68,4 +67,41 @@ jobs:
           for path in Path(".github/workflows").glob("*.yml"):
               if not isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), dict):
                   raise SystemExit(f"{path}: expected a YAML mapping")
+          if not isinstance(yaml.safe_load(Path("deploy/compose.yaml").read_text()), dict):
+              raise SystemExit("deploy/compose.yaml: expected a YAML mapping")
           PY
+
+      - name: Smoke-test container image
+        if: matrix.python-version == '3.12'
+        run: |
+          set -euo pipefail
+          VERSION="$(
+            python -I -S -c \
+              "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])" \
+              < pyproject.toml
+          )"
+          image="atvr4samsung-ci:${VERSION}"
+          docker build \
+            --build-arg "VERSION=${VERSION}" \
+            --build-arg "VCS_REF=${GITHUB_SHA}" \
+            --tag "$image" \
+            .
+          docker run --rm "$image" --version
+          mkdir -p .container-validation/state
+          cp deploy/config.example.yaml .container-validation/config.yaml
+          chmod 0700 .container-validation/state
+          chmod 0600 .container-validation/config.yaml
+          docker run --rm \
+            --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777 \
+            --user "$(id -u):$(id -g)" \
+            --volume "$PWD/.container-validation/config.yaml:/config/config.yaml:ro" \
+            --volume "$PWD/.container-validation/state:/data" \
+            "$image" \
+            --config /config/config.yaml \
+            --check
+          ATVR4SAMSUNG_IMAGE="$image" \
+          ATVR4SAMSUNG_UID="$(id -u)" \
+          ATVR4SAMSUNG_GID="$(id -g)" \
+            docker compose -f deploy/compose.yaml config --quiet

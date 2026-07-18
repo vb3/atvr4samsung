@@ -7,6 +7,9 @@ config.local.yaml
 *.local.yaml
 # ...but DO keep the committed template:
 !config.example.yaml
+!deploy/config.example.yaml
+deploy/image.env
+deploy/.deploy-state/
 
 # Pairing keys, Samsung tokens, and any persisted runtime state.
 *.token
@@ -39,6 +42,7 @@ tests/.secure-pipx-lock-integration/
 tests/.secure-pipx-lock-integration-*/
 tests/.secure-canonical-docs/
 tests/.secure-build-script/
+tests/.container-deploy-*/
 .test-samsung-tls-*/
 .mypy_cache/
 .ruff_cache/

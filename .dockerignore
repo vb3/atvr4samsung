@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.pytest_cache
+build
+dist
+docs
+tests
+scripts
+systemd
+config.yaml
+state
+*.token
+*-token.txt
+**/__pycache__
+**/*.py[cod]

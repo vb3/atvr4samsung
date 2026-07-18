@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [2.0.0] - 2026-07-18
+
+### Added
+
+- Added a hardened multi-platform OCI image for `linux/amd64` and `linux/arm64`, plus an attested
+  deployment bundle containing Docker Compose, a container config template, and one lifecycle
+  manager.
+- Added exact GHCR digest verification, provenance and SBOM attestations, health-gated upgrades,
+  attested bundle self-updates, durable atomic rollback metadata, automatic rollback, and
+  conservative discovery guidance for migrating existing 1.x installs.
+- Added per-platform amd64/arm64 SBOM attestations and an anonymous GHCR pull gate before immutable
+  release publication.
+- Added downloadable offline attestations and a signed release manifest that binds each requested
+  version to its source commit, exact OCI digest, and deployment-bundle SHA-256, eliminating the
+  GitHub login/token requirement for public installs, upgrades, and image recovery.
+- Pinned the Dockerfile frontend, privileged QEMU binfmt image, and BuildKit daemon by digest before
+  registry authentication, and replaced the mutable SBOM installer with a versioned,
+  checksum-pinned Syft release binary plus a checksum-pinned Buildx client.
+- Hash-constrained the isolated Python build requirements and their transitive packaging dependency,
+  propagated targeted filesystem-sync failures, and made interrupted manual rollback restore and
+  health-check the pre-rollback container before clearing recovery state.
+- Require GitHub CLI 2.67.0 or newer so missing attestations cannot be accepted by an affected older
+  verifier.
+- Added a local listener healthcheck and hardware-free container, deployment-manager, bundle, and
+  release-contract tests.
+
+### Changed
+
+- Made Docker Engine plus Compose on Linux the sole production deployment path. The container uses
+  host networking for mDNS/Wake-on-LAN while running unprivileged with a read-only root, all
+  capabilities dropped, `no-new-privileges`, and only private state writable.
+- Simplified install and upgrade documentation around one verified deployment bundle and one manager
+  command per lifecycle and paired-device administration operation.
+- Releases now publish an immutable digest-attested image and deployment bundle instead of native
+  Python installation assets.
+
+### Removed
+
+- Removed the pipx installer, PEP 751 installer transaction/verifier, native release asset set,
+  generated/reference systemd units, `install-service` CLI command, and their specialized tests.
+
 ## [1.1.0] - 2026-07-18
 
 ### Added

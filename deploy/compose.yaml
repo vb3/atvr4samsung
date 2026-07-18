@@ -1,0 +1,43 @@
+services:
+  atvr4samsung:
+    image: ${ATVR4SAMSUNG_IMAGE:?set ATVR4SAMSUNG_IMAGE to a verified digest}
+    pull_policy: never
+    container_name: atvr4samsung
+    network_mode: host
+    user: "${ATVR4SAMSUNG_UID:?set ATVR4SAMSUNG_UID}:${ATVR4SAMSUNG_GID:?set ATVR4SAMSUNG_GID}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    environment:
+      HOME: /data
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - type: bind
+        source: ./config.yaml
+        target: /config/config.yaml
+        read_only: true
+      - type: bind
+        source: ./state
+        target: /data
+    command:
+      - --config
+      - /config/config.yaml
+    healthcheck:
+      test:
+        - CMD
+        - atvr4samsung
+        - --config
+        - /config/config.yaml
+        - healthcheck
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 4

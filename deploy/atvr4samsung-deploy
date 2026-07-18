@@ -1,0 +1,1402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly ATVR4SAMSUNG_IMAGE_REPO='ghcr.io/vb3/atvr4samsung'
+readonly ATVR4SAMSUNG_REPO='vb3/atvr4samsung'
+readonly ATVR4SAMSUNG_RELEASE_WORKFLOW='vb3/atvr4samsung/.github/workflows/release.yml'
+readonly ATVR4SAMSUNG_DEPLOYMENT_MAJOR=2
+readonly ATVR4SAMSUNG_SERVICE='atvr4samsung'
+readonly ATVR4SAMSUNG_HEALTH_ATTEMPTS=60
+readonly ATVR4SAMSUNG_HEALTH_DELAY_SECONDS=1
+
+SELF_PATH=''
+SELF_DIR=''
+DEPLOY_DIR=''
+COMPOSE_FILE=''
+CONFIG_TEMPLATE=''
+CONFIG_FILE=''
+STATE_DIR=''
+IMAGE_ENV=''
+PRIVATE_STATE_DIR=''
+RELEASE_RECORDS_DIR=''
+LOCK_FILE=''
+BUNDLE_TRANSACTION_FILE=''
+ROLLBACK_TRANSACTION_FILE=''
+ROLLBACK_BACKUP_ENV=''
+
+RESOLVED_REPO_DIGEST=''
+RESOLVED_SOURCE_COMMIT=''
+HEALTH_ERROR=''
+METADATA_IMAGE=''
+METADATA_SOURCE_COMMIT=''
+METADATA_UID=''
+METADATA_GID=''
+METADATA_PREVIOUS_IMAGE=''
+METADATA_PREVIOUS_SOURCE_COMMIT=''
+BUNDLE_WORKSPACE=''
+BUNDLE_ASSET_DIR=''
+BUNDLE_BACKUP_DIR=''
+RELEASE_MANIFEST_PATH=''
+RELEASE_ATTESTATION_PATH=''
+RELEASE_MANIFEST_VERSION=''
+RELEASE_MANIFEST_IMAGE=''
+RELEASE_MANIFEST_SOURCE_COMMIT=''
+RELEASE_MANIFEST_BUNDLE_SHA256=''
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  atvr4samsung-deploy install X.Y.Z
+  atvr4samsung-deploy upgrade X.Y.Z
+  atvr4samsung-deploy rollback
+  atvr4samsung-deploy start
+  atvr4samsung-deploy check
+  atvr4samsung-deploy doctor
+  atvr4samsung-deploy trust-tv [args...]
+  atvr4samsung-deploy pair [args...]
+  atvr4samsung-deploy pairs
+  atvr4samsung-deploy revoke IDENTIFIER
+  atvr4samsung-deploy unpair [args...]
+  atvr4samsung-deploy status
+  atvr4samsung-deploy logs [args...]
+  atvr4samsung-deploy restart
+  atvr4samsung-deploy stop
+  atvr4samsung-deploy uninstall
+  atvr4samsung-deploy migrate-native
+USAGE
+}
+
+fail() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf '%s\n' "$*" >&2
+}
+
+contains_control_chars() {
+  local value=${1-}
+  [[ ${value} =~ [[:cntrl:]] ]]
+}
+
+validate_text_input() {
+  local label=$1
+  local value=$2
+  if contains_control_chars "$value"; then
+    fail "$label must not contain control characters"
+  fi
+}
+
+validate_version() {
+  local version=$1
+  validate_text_input 'version' "$version"
+  if [[ ! $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    fail "version must be strict X.Y.Z (got $version)"
+  fi
+}
+
+validate_supported_version() {
+  local version=$1
+  validate_version "$version"
+  [[ ${version%%.*} == "$ATVR4SAMSUNG_DEPLOYMENT_MAJOR" ]] ||
+    fail "this deployment manager supports only ${ATVR4SAMSUNG_DEPLOYMENT_MAJOR}.x releases"
+}
+
+stat_mode() {
+  local path=$1
+  local mode=''
+  if mode=$(stat -Lc '%a' -- "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if mode=$(stat -f '%OLp' -- "$path" 2>/dev/null); then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  fail "could not read permissions for $path"
+}
+
+require_no_group_other_write() {
+  local path=$1
+  local mode
+  mode=$(stat_mode "$path")
+  [[ $mode =~ ^[0-7]+$ ]] || fail "unexpected permission format for $path"
+  if (( (8#$mode & 8#022) != 0 )); then
+    fail "$path must not be group- or other-writable"
+  fi
+}
+
+require_owned_path() {
+  local path=$1
+  [[ -O $path ]] || fail "$path must be owned by uid $(id -u)"
+}
+
+require_existing_directory() {
+  local path=$1
+  [[ -e $path ]] || fail "$path does not exist"
+  [[ ! -L $path ]] || fail "$path must not be a symlink"
+  [[ -d $path ]] || fail "$path must be a directory"
+  require_owned_path "$path"
+}
+
+require_existing_file() {
+  local path=$1
+  [[ -e $path ]] || fail "$path does not exist"
+  [[ ! -L $path ]] || fail "$path must not be a symlink"
+  [[ -f $path ]] || fail "$path must be a regular file"
+  require_owned_path "$path"
+}
+
+ensure_directory() {
+  local path=$1
+  local mode=$2
+  if [[ -e $path ]]; then
+    [[ ! -L $path ]] || fail "$path must not be a symlink"
+    [[ -d $path ]] || fail "$path must be a directory"
+    require_owned_path "$path"
+  else
+    mkdir -p -- "$path"
+  fi
+  chmod "$mode" "$path"
+  local actual_mode
+  actual_mode=$(stat_mode "$path")
+  [[ $actual_mode == $mode ]] || fail "$path must have mode $mode"
+}
+
+ensure_private_file_mode() {
+  local path=$1
+  local mode=$2
+  require_existing_file "$path"
+  chmod "$mode" "$path"
+  local actual_mode
+  actual_mode=$(stat_mode "$path")
+  [[ $actual_mode == $mode ]] || fail "$path must have mode $mode"
+}
+
+atomic_copy_file() {
+  local source=$1
+  local destination=$2
+  local mode=${3-600}
+  local parent base temp_path
+  parent=$(dirname -- "$destination")
+  base=$(basename -- "$destination")
+  temp_path=$(mktemp "$parent/.${base}.tmp.XXXXXX") || return 1
+  chmod "$mode" "$temp_path" || return 1
+  if ! cat -- "$source" >"$temp_path"; then
+    rm -f -- "$temp_path"
+    return 1
+  fi
+  sync_path "$temp_path" || return 1
+  mv -f "$temp_path" "$destination" || return 1
+  chmod "$mode" "$destination" || return 1
+  sync_path "$parent"
+}
+
+sync_path() {
+  local path=$1
+  sync -f "$path"
+}
+
+compose_with_assets() {
+  local compose_file=$1
+  local env_file=$2
+  shift 2
+  env \
+    -u ATVR4SAMSUNG_IMAGE \
+    -u ATVR4SAMSUNG_SOURCE_COMMIT \
+    -u ATVR4SAMSUNG_UID \
+    -u ATVR4SAMSUNG_GID \
+    -u ATVR4SAMSUNG_PREVIOUS_IMAGE \
+    -u ATVR4SAMSUNG_PREVIOUS_SOURCE_COMMIT \
+    docker compose \
+    --project-directory "$DEPLOY_DIR" \
+    --file "$compose_file" \
+    --env-file "$env_file" \
+    "$@"
+}
+
+compose_raw() {
+  compose_with_assets "$COMPOSE_FILE" "$IMAGE_ENV" "$@"
+}
+
+compose_cmd() {
+  local resolved_images
+  load_image_metadata "$IMAGE_ENV"
+  resolved_images=$(compose_raw config --images) ||
+    fail 'docker compose could not resolve the verified deployment model'
+  [[ $resolved_images == "$METADATA_IMAGE" ]] ||
+    fail 'docker compose resolved an image other than the verified pinned digest'
+  compose_raw "$@"
+}
+
+require_compose_assets() {
+  require_existing_file "$COMPOSE_FILE"
+  require_existing_file "$CONFIG_TEMPLATE"
+}
+
+require_metadata_file() {
+  local path=$1
+  ensure_private_file_mode "$path" 600
+}
+
+require_runtime_prerequisites() {
+  command -v docker >/dev/null 2>&1 || fail 'docker is required'
+  command -v sync >/dev/null 2>&1 || fail 'sync is required for durable deployment metadata'
+  docker compose version >/dev/null 2>&1 || fail 'docker compose is required'
+}
+
+gh_version_is_supported() {
+  local version major minor patch
+  version=$(gh --version 2>/dev/null | awk 'NR == 1 { print $3 }') || return 1
+  [[ $version =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+  major=${BASH_REMATCH[1]}
+  minor=${BASH_REMATCH[2]}
+  patch=${BASH_REMATCH[3]}
+  (( major > 2 || (major == 2 && (minor > 67 || (minor == 67 && patch >= 0))) ))
+}
+
+require_gh_prerequisites() {
+  command -v gh >/dev/null 2>&1 || fail 'gh is required'
+  gh_version_is_supported ||
+    fail 'gh 2.67.0 or newer is required for fail-closed attestation verification'
+  command -v curl >/dev/null 2>&1 || fail 'curl is required for public release downloads'
+  command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is required for release verification'
+  command -v tar >/dev/null 2>&1 || fail 'tar is required for verified deployment bundles'
+}
+
+resolve_self() {
+  SELF_PATH=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")
+  SELF_DIR=$(dirname -- "$SELF_PATH")
+}
+
+resolve_deploy_paths() {
+  local override=${ATVR4SAMSUNG_DEPLOY_DIR-}
+  if [[ -n $override ]]; then
+    validate_text_input 'ATVR4SAMSUNG_DEPLOY_DIR' "$override"
+    [[ $override = /* ]] || fail 'ATVR4SAMSUNG_DEPLOY_DIR must be an absolute path'
+    DEPLOY_DIR=$override
+  else
+    DEPLOY_DIR=$SELF_DIR
+  fi
+
+  validate_text_input 'deployment directory' "$DEPLOY_DIR"
+  require_existing_directory "$DEPLOY_DIR"
+  require_no_group_other_write "$DEPLOY_DIR"
+
+  COMPOSE_FILE="$DEPLOY_DIR/compose.yaml"
+  CONFIG_TEMPLATE="$DEPLOY_DIR/config.example.yaml"
+  CONFIG_FILE="$DEPLOY_DIR/config.yaml"
+  STATE_DIR="$DEPLOY_DIR/state"
+  IMAGE_ENV="$DEPLOY_DIR/image.env"
+  PRIVATE_STATE_DIR="$DEPLOY_DIR/.deploy-state"
+  RELEASE_RECORDS_DIR="$PRIVATE_STATE_DIR/releases"
+  LOCK_FILE="$PRIVATE_STATE_DIR/lock"
+  BUNDLE_TRANSACTION_FILE="$PRIVATE_STATE_DIR/bundle-transaction"
+  ROLLBACK_TRANSACTION_FILE="$PRIVATE_STATE_DIR/rollback-transaction"
+  ROLLBACK_BACKUP_ENV="$PRIVATE_STATE_DIR/rollback-backup.env"
+}
+
+ensure_private_state_paths() {
+  ensure_directory "$PRIVATE_STATE_DIR" 700
+  if [[ -e $LOCK_FILE ]]; then
+    ensure_private_file_mode "$LOCK_FILE" 600
+  else
+    : >"$LOCK_FILE"
+    chmod 600 "$LOCK_FILE"
+  fi
+}
+
+with_lock() {
+  command -v flock >/dev/null 2>&1 || fail 'flock is required for mutating commands on Linux'
+  ensure_private_state_paths
+  exec 9>"$LOCK_FILE"
+  flock 9
+  recover_interrupted_bundle_update
+  recover_interrupted_rollback
+  "$@"
+}
+
+ensure_install_layout() {
+  local config_source=${1-$CONFIG_TEMPLATE}
+  require_compose_assets
+  require_existing_file "$config_source"
+  ensure_directory "$STATE_DIR" 700
+  if [[ -e $CONFIG_FILE ]]; then
+    ensure_private_file_mode "$CONFIG_FILE" 600
+  else
+    atomic_copy_file "$config_source" "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+  fi
+}
+
+require_deployment_state() {
+  require_compose_assets
+  ensure_private_file_mode "$CONFIG_FILE" 600
+  ensure_directory "$STATE_DIR" 700
+}
+
+require_current_image_env() {
+  require_metadata_file "$IMAGE_ENV"
+  load_image_metadata "$IMAGE_ENV"
+}
+
+require_previous_metadata() {
+  load_image_metadata "$IMAGE_ENV"
+  [[ -n $METADATA_PREVIOUS_IMAGE ]] || fail 'no previous verified image is available for rollback'
+}
+
+current_uid() {
+  id -u
+}
+
+current_gid() {
+  id -g
+}
+
+download_public_release_asset() {
+  local version=$1
+  local name=$2
+  local destination=$3
+  local temp_path="${destination}.download"
+  local url="https://github.com/$ATVR4SAMSUNG_REPO/releases/download/v${version}/${name}"
+
+  validate_supported_version "$version"
+  validate_text_input 'release asset name' "$name"
+  [[ $name != */* && $name != .* ]] || fail 'release asset name is invalid'
+  rm -f -- "$temp_path"
+  if ! curl \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --connect-timeout 15 \
+    --max-time 300 \
+    --retry 3 \
+    --retry-connrefused \
+    --retry-delay 2 \
+    --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' \
+    --header 'Accept: application/octet-stream' \
+    --header 'Accept-Language: en-US,en;q=0.9' \
+    --header 'Sec-CH-UA: "Chromium";v="136", "Not.A/Brand";v="99"' \
+    --output "$temp_path" \
+    "$url"; then
+    rm -f -- "$temp_path"
+    fail "could not download public release asset $name"
+  fi
+  chmod 600 "$temp_path"
+  mv -f -- "$temp_path" "$destination"
+}
+
+load_release_manifest() {
+  local path=$1
+  local expected_version=${2-}
+  local line key value
+  local seen_version=0 seen_image=0 seen_source=0 seen_bundle=0
+
+  RELEASE_MANIFEST_VERSION=''
+  RELEASE_MANIFEST_IMAGE=''
+  RELEASE_MANIFEST_SOURCE_COMMIT=''
+  RELEASE_MANIFEST_BUNDLE_SHA256=''
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line == *=* ]] || fail "$path contains malformed release metadata"
+    validate_text_input 'release metadata' "$line"
+    key=${line%%=*}
+    value=${line#*=}
+    [[ -n $value ]] || fail "$path contains empty release metadata"
+    case "$key" in
+      ATVR4SAMSUNG_RELEASE_VERSION)
+        (( seen_version == 0 )) || fail "$path contains duplicate release version"
+        seen_version=1
+        RELEASE_MANIFEST_VERSION=$value
+        ;;
+      ATVR4SAMSUNG_RELEASE_IMAGE)
+        (( seen_image == 0 )) || fail "$path contains duplicate release image"
+        seen_image=1
+        RELEASE_MANIFEST_IMAGE=$value
+        ;;
+      ATVR4SAMSUNG_RELEASE_SOURCE_COMMIT)
+        (( seen_source == 0 )) || fail "$path contains duplicate release source"
+        seen_source=1
+        RELEASE_MANIFEST_SOURCE_COMMIT=$value
+        ;;
+      ATVR4SAMSUNG_DEPLOY_BUNDLE_SHA256)
+        (( seen_bundle == 0 )) || fail "$path contains duplicate deployment bundle digest"
+        seen_bundle=1
+        RELEASE_MANIFEST_BUNDLE_SHA256=$value
+        ;;
+      *)
+        fail "$path contains unsupported release metadata key $key"
+        ;;
+    esac
+  done <"$path"
+
+  (( seen_version && seen_image && seen_source && seen_bundle )) ||
+    fail "$path is missing required release metadata"
+  validate_supported_version "$RELEASE_MANIFEST_VERSION"
+  if [[ -n $expected_version ]]; then
+    [[ $RELEASE_MANIFEST_VERSION == "$expected_version" ]] ||
+      fail "release metadata version does not match requested version $expected_version"
+  fi
+  [[ $RELEASE_MANIFEST_IMAGE =~ ^ghcr\.io/vb3/atvr4samsung@sha256:[0-9a-f]{64}$ ]] ||
+    fail "$path does not contain a valid release image digest"
+  [[ $RELEASE_MANIFEST_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
+    fail "$path does not contain a valid release source commit"
+  [[ $RELEASE_MANIFEST_BUNDLE_SHA256 =~ ^[0-9a-f]{64}$ ]] ||
+    fail "$path does not contain a valid deployment bundle digest"
+}
+
+verify_release_manifest() {
+  local manifest=$1
+  local attestation=$2
+  gh attestation verify "$manifest" \
+    --bundle "$attestation" \
+    --repo "$ATVR4SAMSUNG_REPO" \
+    --signer-workflow "$ATVR4SAMSUNG_RELEASE_WORKFLOW" \
+    --source-digest "$RELEASE_MANIFEST_SOURCE_COMMIT" \
+    --source-ref refs/heads/main \
+    --deny-self-hosted-runners >/dev/null
+}
+
+persist_release_record() {
+  local record_dir="$RELEASE_RECORDS_DIR/$RELEASE_MANIFEST_SOURCE_COMMIT"
+  ensure_directory "$RELEASE_RECORDS_DIR" 700
+  ensure_directory "$record_dir" 700
+  atomic_copy_file "$RELEASE_MANIFEST_PATH" "$record_dir/release.env" 600 ||
+    fail 'could not persist verified release metadata'
+  atomic_copy_file "$RELEASE_ATTESTATION_PATH" "$record_dir/release.sigstore.json" 600 ||
+    fail 'could not persist verified release attestation'
+}
+
+download_verified_release_manifest() {
+  local version=$1
+  local manifest_name="atvr4samsung-${version}-release.env"
+  local attestation_name="atvr4samsung-${version}-release.sigstore.json"
+
+  BUNDLE_WORKSPACE=$(mktemp -d "$PRIVATE_STATE_DIR/.bundle.XXXXXX")
+  chmod 700 "$BUNDLE_WORKSPACE"
+  trap cleanup_bundle_workspace EXIT
+  RELEASE_MANIFEST_PATH="$BUNDLE_WORKSPACE/$manifest_name"
+  RELEASE_ATTESTATION_PATH="$BUNDLE_WORKSPACE/$attestation_name"
+
+  download_public_release_asset "$version" "$manifest_name" "$RELEASE_MANIFEST_PATH"
+  download_public_release_asset "$version" "$attestation_name" "$RELEASE_ATTESTATION_PATH"
+  require_existing_file "$RELEASE_MANIFEST_PATH"
+  require_existing_file "$RELEASE_ATTESTATION_PATH"
+  load_release_manifest "$RELEASE_MANIFEST_PATH" "$version"
+  verify_release_manifest "$RELEASE_MANIFEST_PATH" "$RELEASE_ATTESTATION_PATH" ||
+    fail 'release metadata failed offline provenance verification'
+
+  RESOLVED_REPO_DIGEST=$RELEASE_MANIFEST_IMAGE
+  RESOLVED_SOURCE_COMMIT=$RELEASE_MANIFEST_SOURCE_COMMIT
+  docker pull "$RESOLVED_REPO_DIGEST" >/dev/null
+  docker image inspect "$RESOLVED_REPO_DIGEST" >/dev/null ||
+    fail 'docker did not retain the verified release image digest'
+  persist_release_record
+}
+
+is_bundle_workspace_path() {
+  local path=$1
+  [[ $path = /* ]] || return 1
+  [[ $(dirname -- "$path") == "$PRIVATE_STATE_DIR" ]] || return 1
+  [[ $(basename -- "$path") =~ ^\.bundle\.[A-Za-z0-9]+$ ]]
+}
+
+cleanup_bundle_workspace() {
+  if [[ -n $BUNDLE_WORKSPACE ]] && is_bundle_workspace_path "$BUNDLE_WORKSPACE"; then
+    rm -rf -- "$BUNDLE_WORKSPACE"
+  fi
+  BUNDLE_WORKSPACE=''
+  BUNDLE_ASSET_DIR=''
+  BUNDLE_BACKUP_DIR=''
+  RELEASE_MANIFEST_PATH=''
+  RELEASE_ATTESTATION_PATH=''
+}
+
+retain_bundle_workspace() {
+  trap - EXIT
+}
+
+validate_bundle_archive() {
+  local archive=$1
+  local version=$2
+  local root="atvr4samsung-${version}-deploy"
+  local actual expected listing
+  actual=$(tar -tzf "$archive" | sed 's:/$::' | LC_ALL=C sort) ||
+    fail 'could not inspect the deployment bundle'
+  expected=$(printf '%s\n' \
+    "$root" \
+    "$root/atvr4samsung-deploy" \
+    "$root/compose.yaml" \
+    "$root/config.example.yaml" | LC_ALL=C sort)
+  [[ $actual == "$expected" ]] || fail 'deployment bundle inventory is not exact'
+
+  while IFS= read -r listing; do
+    case ${listing:0:1} in
+      -|d) ;;
+      *) fail 'deployment bundle contains a non-file member' ;;
+    esac
+  done < <(tar -tvzf "$archive")
+}
+
+download_release_bundle() {
+  local version=$1
+  local archive root actual_digest
+  archive="$BUNDLE_WORKSPACE/atvr4samsung-${version}-deploy.tar.gz"
+  root="atvr4samsung-${version}-deploy"
+
+  [[ -n $BUNDLE_WORKSPACE ]] || fail 'release workspace is not initialized'
+  download_public_release_asset "$version" "$(basename -- "$archive")" "$archive"
+  require_existing_file "$archive"
+  actual_digest=$(sha256sum "$archive" | awk '{ print $1 }')
+  [[ $actual_digest == "$RELEASE_MANIFEST_BUNDLE_SHA256" ]] ||
+    fail 'deployment bundle digest does not match the signed release metadata'
+  validate_bundle_archive "$archive" "$version"
+  tar -xzf "$archive" --no-same-owner -C "$BUNDLE_WORKSPACE"
+
+  BUNDLE_ASSET_DIR="$BUNDLE_WORKSPACE/$root"
+  BUNDLE_BACKUP_DIR="$BUNDLE_WORKSPACE/backup"
+  require_existing_directory "$BUNDLE_ASSET_DIR"
+  require_existing_file "$BUNDLE_ASSET_DIR/atvr4samsung-deploy"
+  require_existing_file "$BUNDLE_ASSET_DIR/compose.yaml"
+  require_existing_file "$BUNDLE_ASSET_DIR/config.example.yaml"
+  bash -n "$BUNDLE_ASSET_DIR/atvr4samsung-deploy"
+}
+
+validate_staged_compose() {
+  local pinned_image=$1
+  local source_commit=$2
+  local uid=$3
+  local gid=$4
+  local previous_image=${5-}
+  local previous_source=${6-}
+  local candidate_env="$BUNDLE_WORKSPACE/candidate.env"
+  local resolved_images
+
+  render_image_env \
+    "$pinned_image" \
+    "$source_commit" \
+    "$uid" \
+    "$gid" \
+    "$previous_image" \
+    "$previous_source" >"$candidate_env"
+  chmod 600 "$candidate_env"
+  resolved_images=$(
+    compose_with_assets "$BUNDLE_ASSET_DIR/compose.yaml" "$candidate_env" config --images
+  ) || fail 'the target deployment bundle contains an invalid Compose model'
+  [[ $resolved_images == "$pinned_image" ]] ||
+    fail 'the target deployment bundle does not resolve to the verified image digest'
+}
+
+backup_bundle_assets() {
+  mkdir "$BUNDLE_BACKUP_DIR" || return 1
+  chmod 700 "$BUNDLE_BACKUP_DIR" || return 1
+  atomic_copy_file \
+    "$DEPLOY_DIR/atvr4samsung-deploy" \
+    "$BUNDLE_BACKUP_DIR/atvr4samsung-deploy" \
+    755 || return 1
+  atomic_copy_file "$COMPOSE_FILE" "$BUNDLE_BACKUP_DIR/compose.yaml" 644 || return 1
+  atomic_copy_file \
+    "$CONFIG_TEMPLATE" \
+    "$BUNDLE_BACKUP_DIR/config.example.yaml" \
+    644 || return 1
+}
+
+publish_bundle_assets() {
+  atomic_copy_file \
+    "$BUNDLE_ASSET_DIR/atvr4samsung-deploy" \
+    "$DEPLOY_DIR/atvr4samsung-deploy" \
+    755 || return 1
+  atomic_copy_file "$BUNDLE_ASSET_DIR/compose.yaml" "$COMPOSE_FILE" 644 || return 1
+  atomic_copy_file \
+    "$BUNDLE_ASSET_DIR/config.example.yaml" \
+    "$CONFIG_TEMPLATE" \
+    644
+}
+
+restore_bundle_assets() {
+  atomic_copy_file \
+    "$BUNDLE_BACKUP_DIR/atvr4samsung-deploy" \
+    "$DEPLOY_DIR/atvr4samsung-deploy" \
+    755 || return 1
+  atomic_copy_file "$BUNDLE_BACKUP_DIR/compose.yaml" "$COMPOSE_FILE" 644 || return 1
+  atomic_copy_file \
+    "$BUNDLE_BACKUP_DIR/config.example.yaml" \
+    "$CONFIG_TEMPLATE" \
+    644
+}
+
+begin_bundle_transaction() {
+  local marker_source="$BUNDLE_WORKSPACE/transaction"
+  printf 'applying\n%s\n' "$BUNDLE_WORKSPACE" >"$marker_source"
+  chmod 600 "$marker_source"
+  atomic_copy_file "$marker_source" "$BUNDLE_TRANSACTION_FILE" 600 ||
+    fail 'could not durably begin the deployment-bundle transaction'
+  retain_bundle_workspace
+}
+
+commit_bundle_transaction() {
+  local marker_source="$BUNDLE_WORKSPACE/transaction"
+  printf 'committed\n%s\n' "$BUNDLE_WORKSPACE" >"$marker_source"
+  chmod 600 "$marker_source"
+  atomic_copy_file "$marker_source" "$BUNDLE_TRANSACTION_FILE" 600
+}
+
+clear_bundle_transaction() {
+  rm -f -- "$BUNDLE_TRANSACTION_FILE" || return 1
+  sync_path "$PRIVATE_STATE_DIR"
+}
+
+finish_bundle_transaction() {
+  if ! commit_bundle_transaction; then
+    retain_bundle_workspace
+    fail "deployment completed but its transaction could not be committed; recovery assets remain at $BUNDLE_BACKUP_DIR"
+  fi
+  if ! clear_bundle_transaction; then
+    retain_bundle_workspace
+    fail "deployment completed and was committed, but its recovery marker could not be cleared; recovery assets remain at $BUNDLE_BACKUP_DIR"
+  fi
+  cleanup_bundle_workspace
+  trap - EXIT
+}
+
+remove_install_image_env() {
+  if [[ -L $IMAGE_ENV ]]; then
+    return 1
+  fi
+  if [[ -e $IMAGE_ENV ]]; then
+    require_existing_file "$IMAGE_ENV"
+    rm -f -- "$IMAGE_ENV" || return 1
+    sync_path "$DEPLOY_DIR" || return 1
+  fi
+}
+
+require_no_pending_transaction() {
+  [[ ! -e $BUNDLE_TRANSACTION_FILE && ! -L $BUNDLE_TRANSACTION_FILE ]] ||
+    fail 'an interrupted bundle update needs recovery; run `atvr4samsung-deploy start` first'
+  [[ ! -e $ROLLBACK_TRANSACTION_FILE && ! -L $ROLLBACK_TRANSACTION_FILE ]] ||
+    fail 'an interrupted rollback needs recovery; run `atvr4samsung-deploy start` first'
+}
+
+recover_interrupted_bundle_update() {
+  local phase='' workspace='' line_count=''
+  [[ -e $BUNDLE_TRANSACTION_FILE || -L $BUNDLE_TRANSACTION_FILE ]] || return 0
+  require_metadata_file "$BUNDLE_TRANSACTION_FILE"
+  line_count=$(awk 'END { print NR }' "$BUNDLE_TRANSACTION_FILE")
+  [[ $line_count == 2 ]] || fail 'bundle recovery marker is malformed'
+  phase=$(sed -n '1p' "$BUNDLE_TRANSACTION_FILE")
+  workspace=$(sed -n '2p' "$BUNDLE_TRANSACTION_FILE")
+  [[ $phase == applying || $phase == committed ]] ||
+    fail 'bundle recovery marker has an invalid phase'
+  validate_text_input 'bundle recovery path' "$workspace"
+  is_bundle_workspace_path "$workspace" ||
+    fail 'bundle recovery marker points outside the private deployment state'
+
+  BUNDLE_WORKSPACE=$workspace
+  BUNDLE_ASSET_DIR="$workspace/unused"
+  BUNDLE_BACKUP_DIR="$workspace/backup"
+  require_existing_directory "$BUNDLE_WORKSPACE"
+  require_existing_directory "$BUNDLE_BACKUP_DIR"
+  require_existing_file "$BUNDLE_BACKUP_DIR/atvr4samsung-deploy"
+  require_existing_file "$BUNDLE_BACKUP_DIR/compose.yaml"
+  require_existing_file "$BUNDLE_BACKUP_DIR/config.example.yaml"
+
+  if [[ $phase == committed ]]; then
+    clear_bundle_transaction ||
+      fail "committed deployment is active but $BUNDLE_TRANSACTION_FILE could not be cleared"
+    cleanup_bundle_workspace
+    warn 'Completed cleanup for an already committed deployment-bundle update.'
+    return 0
+  fi
+
+  restore_bundle_assets || fail "could not restore interrupted bundle assets from $BUNDLE_BACKUP_DIR"
+
+  if [[ -e $BUNDLE_BACKUP_DIR/image.env || -L $BUNDLE_BACKUP_DIR/image.env ]]; then
+    require_metadata_file "$BUNDLE_BACKUP_DIR/image.env"
+    atomic_copy_file "$BUNDLE_BACKUP_DIR/image.env" "$IMAGE_ENV" 600 ||
+      fail "could not restore interrupted deployment metadata from $BUNDLE_BACKUP_DIR"
+    require_runtime_prerequisites
+    ensure_pinned_image_available "$IMAGE_ENV" ||
+      fail "could not recover the prior image: $HEALTH_ERROR"
+    compose_cmd up -d >/dev/null ||
+      fail 'could not recreate the prior container during bundle recovery'
+    wait_for_service_health ||
+      fail "the prior container did not recover: $HEALTH_ERROR"
+  elif [[ -e $IMAGE_ENV || -L $IMAGE_ENV ]]; then
+    require_metadata_file "$IMAGE_ENV"
+    rm -f -- "$IMAGE_ENV"
+    sync_path "$DEPLOY_DIR"
+  fi
+
+  clear_bundle_transaction ||
+    fail "interrupted bundle assets were restored but $BUNDLE_TRANSACTION_FILE could not be cleared"
+  cleanup_bundle_workspace
+  warn 'Recovered an interrupted deployment-bundle update; the prior deployment metadata is active.'
+}
+
+begin_rollback_transaction() {
+  local marker_source
+  atomic_copy_file "$IMAGE_ENV" "$ROLLBACK_BACKUP_ENV" 600 ||
+    fail 'could not durably back up current metadata before rollback'
+  marker_source=$(mktemp "$PRIVATE_STATE_DIR/.rollback.marker.XXXXXX")
+  chmod 600 "$marker_source"
+  printf 'applying\n' >"$marker_source"
+  if ! atomic_copy_file "$marker_source" "$ROLLBACK_TRANSACTION_FILE" 600; then
+    rm -f -- "$marker_source"
+    fail 'could not durably begin the rollback transaction'
+  fi
+  rm -f -- "$marker_source"
+}
+
+commit_rollback_transaction() {
+  local marker_source
+  marker_source=$(mktemp "$PRIVATE_STATE_DIR/.rollback.marker.XXXXXX") || return 1
+  chmod 600 "$marker_source" || return 1
+  printf 'committed\n' >"$marker_source" || return 1
+  if ! atomic_copy_file "$marker_source" "$ROLLBACK_TRANSACTION_FILE" 600; then
+    rm -f -- "$marker_source"
+    return 1
+  fi
+  rm -f -- "$marker_source"
+}
+
+clear_rollback_transaction() {
+  rm -f -- "$ROLLBACK_TRANSACTION_FILE" || return 1
+  sync_path "$PRIVATE_STATE_DIR" || return 1
+  rm -f -- "$ROLLBACK_BACKUP_ENV" || return 1
+  sync_path "$PRIVATE_STATE_DIR"
+}
+
+recover_interrupted_rollback() {
+  local phase='' line_count=''
+  [[ -e $ROLLBACK_TRANSACTION_FILE || -L $ROLLBACK_TRANSACTION_FILE ]] || return 0
+  require_metadata_file "$ROLLBACK_TRANSACTION_FILE"
+  line_count=$(awk 'END { print NR }' "$ROLLBACK_TRANSACTION_FILE")
+  [[ $line_count == 1 ]] || fail 'rollback recovery marker is malformed'
+  IFS= read -r phase <"$ROLLBACK_TRANSACTION_FILE" ||
+    fail 'rollback recovery marker is empty'
+  [[ $phase == applying || $phase == committed ]] ||
+    fail 'rollback recovery marker has an invalid phase'
+  require_metadata_file "$ROLLBACK_BACKUP_ENV"
+
+  if [[ $phase == committed ]]; then
+    clear_rollback_transaction ||
+      fail 'committed rollback is active but its recovery state could not be cleared'
+    warn 'Completed cleanup for an already committed rollback.'
+    return 0
+  fi
+
+  atomic_copy_file "$ROLLBACK_BACKUP_ENV" "$IMAGE_ENV" 600 ||
+    fail 'could not restore metadata from an interrupted rollback'
+  require_runtime_prerequisites
+  ensure_pinned_image_available "$IMAGE_ENV" ||
+    fail "could not recover the pre-rollback image: $HEALTH_ERROR"
+  compose_cmd up -d >/dev/null ||
+    fail 'could not recreate the pre-rollback container'
+  wait_for_service_health ||
+    fail "the pre-rollback container did not recover: $HEALTH_ERROR"
+  clear_rollback_transaction ||
+    fail 'the interrupted rollback recovered but its recovery state could not be cleared'
+  warn 'Recovered an interrupted rollback; the pre-rollback image is active.'
+}
+
+render_image_env() {
+  local pinned_image=$1
+  local source_commit=$2
+  local uid=$3
+  local gid=$4
+  local previous_image=${5-}
+  local previous_source_commit=${6-}
+  printf 'ATVR4SAMSUNG_IMAGE=%s\nATVR4SAMSUNG_SOURCE_COMMIT=%s\nATVR4SAMSUNG_UID=%s\nATVR4SAMSUNG_GID=%s\n' \
+    "$pinned_image" "$source_commit" "$uid" "$gid"
+  if [[ -n $previous_image ]]; then
+    printf 'ATVR4SAMSUNG_PREVIOUS_IMAGE=%s\nATVR4SAMSUNG_PREVIOUS_SOURCE_COMMIT=%s\n' \
+      "$previous_image" "$previous_source_commit"
+  fi
+}
+
+publish_image_env() {
+  local pinned_image=$1
+  local source_commit=$2
+  local uid=$3
+  local gid=$4
+  local previous_image=${5-}
+  local previous_source_commit=${6-}
+  local parent base temp_path
+  parent=$(dirname -- "$IMAGE_ENV")
+  base=$(basename -- "$IMAGE_ENV")
+  temp_path=$(mktemp "$parent/.${base}.tmp.XXXXXX") || return 1
+  chmod 600 "$temp_path" || return 1
+  if ! render_image_env \
+    "$pinned_image" \
+    "$source_commit" \
+    "$uid" \
+    "$gid" \
+    "$previous_image" \
+    "$previous_source_commit" >"$temp_path"; then
+    rm -f -- "$temp_path"
+    return 1
+  fi
+  sync_path "$temp_path" || return 1
+  mv -f "$temp_path" "$IMAGE_ENV" || return 1
+  chmod 600 "$IMAGE_ENV" || return 1
+  sync_path "$parent"
+}
+
+load_image_metadata() {
+  local path=$1
+  local line key value
+  local seen_image=0 seen_source=0 seen_uid=0 seen_gid=0
+  local seen_previous_image=0 seen_previous_source=0
+
+  METADATA_IMAGE=''
+  METADATA_SOURCE_COMMIT=''
+  METADATA_UID=''
+  METADATA_GID=''
+  METADATA_PREVIOUS_IMAGE=''
+  METADATA_PREVIOUS_SOURCE_COMMIT=''
+
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -n $line && $line == *=* ]] || fail "$path contains malformed metadata"
+    validate_text_input 'image metadata' "$line"
+    key=${line%%=*}
+    value=${line#*=}
+    [[ -n $value ]] || fail "$path contains empty metadata"
+    case "$key" in
+      ATVR4SAMSUNG_IMAGE)
+        (( seen_image == 0 )) || fail "$path contains duplicate image metadata"
+        seen_image=1
+        METADATA_IMAGE=$value
+        ;;
+      ATVR4SAMSUNG_SOURCE_COMMIT)
+        (( seen_source == 0 )) || fail "$path contains duplicate source metadata"
+        seen_source=1
+        METADATA_SOURCE_COMMIT=$value
+        ;;
+      ATVR4SAMSUNG_UID)
+        (( seen_uid == 0 )) || fail "$path contains duplicate uid metadata"
+        seen_uid=1
+        METADATA_UID=$value
+        ;;
+      ATVR4SAMSUNG_GID)
+        (( seen_gid == 0 )) || fail "$path contains duplicate gid metadata"
+        seen_gid=1
+        METADATA_GID=$value
+        ;;
+      ATVR4SAMSUNG_PREVIOUS_IMAGE)
+        (( seen_previous_image == 0 )) || fail "$path contains duplicate previous image metadata"
+        seen_previous_image=1
+        METADATA_PREVIOUS_IMAGE=$value
+        ;;
+      ATVR4SAMSUNG_PREVIOUS_SOURCE_COMMIT)
+        (( seen_previous_source == 0 )) || fail "$path contains duplicate previous source metadata"
+        seen_previous_source=1
+        METADATA_PREVIOUS_SOURCE_COMMIT=$value
+        ;;
+      *)
+        fail "$path contains unsupported metadata key $key"
+        ;;
+    esac
+  done <"$path"
+
+  (( seen_image && seen_source && seen_uid && seen_gid )) ||
+    fail "$path is missing required deployment metadata"
+  (( seen_previous_image == seen_previous_source )) ||
+    fail "$path contains incomplete rollback metadata"
+  [[ $METADATA_IMAGE =~ ^ghcr\.io/vb3/atvr4samsung@sha256:[0-9a-f]{64}$ ]] ||
+    fail "$path does not contain a valid atvr4samsung image digest"
+  [[ $METADATA_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
+    fail "$path does not contain a valid source commit"
+  [[ $METADATA_UID =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "$path does not contain a valid uid"
+  [[ $METADATA_GID =~ ^(0|[1-9][0-9]*)$ ]] ||
+    fail "$path does not contain a valid gid"
+  if (( seen_previous_image )); then
+    [[ $METADATA_PREVIOUS_IMAGE =~ ^ghcr\.io/vb3/atvr4samsung@sha256:[0-9a-f]{64}$ ]] ||
+      fail "$path does not contain a valid previous atvr4samsung image digest"
+    [[ $METADATA_PREVIOUS_SOURCE_COMMIT =~ ^[0-9a-f]{40}$ ]] ||
+      fail "$path does not contain a valid previous source commit"
+  fi
+}
+
+ensure_pinned_image_available() {
+  local metadata_path=$1
+  local pinned_image source_commit
+  load_image_metadata "$metadata_path"
+  pinned_image=$METADATA_IMAGE
+  source_commit=$METADATA_SOURCE_COMMIT
+
+  if docker image inspect "$pinned_image" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v gh >/dev/null 2>&1 || ! gh_version_is_supported; then
+    HEALTH_ERROR='the pinned image is missing locally and gh 2.67.0+ is unavailable for verified recovery'
+    return 1
+  fi
+  local record_dir="$RELEASE_RECORDS_DIR/$source_commit"
+  local manifest="$record_dir/release.env"
+  local attestation="$record_dir/release.sigstore.json"
+  if [[ ! -f $manifest || -L $manifest || ! -f $attestation || -L $attestation ]]; then
+    HEALTH_ERROR='the pinned image is missing locally and its verified release record is unavailable'
+    return 1
+  fi
+  load_release_manifest "$manifest"
+  if [[ $RELEASE_MANIFEST_IMAGE != "$pinned_image" \
+     || $RELEASE_MANIFEST_SOURCE_COMMIT != "$source_commit" ]]; then
+    HEALTH_ERROR='the persisted release record does not match the pinned image metadata'
+    return 1
+  fi
+  if ! verify_release_manifest "$manifest" "$attestation"; then
+    HEALTH_ERROR='the persisted release record failed offline provenance verification'
+    return 1
+  fi
+  if ! docker pull "$pinned_image" >/dev/null; then
+    HEALTH_ERROR='could not restore the pinned image by digest'
+    return 1
+  fi
+}
+
+wait_for_service_health() {
+  local container_id='' inspection='' health='' status='' exit_code='' attempt=1
+  HEALTH_ERROR=''
+  container_id=$(compose_cmd ps -q "$ATVR4SAMSUNG_SERVICE")
+  if [[ -z $container_id ]]; then
+    HEALTH_ERROR='docker compose did not create the atvr4samsung container'
+    return 1
+  fi
+
+  while (( attempt <= ATVR4SAMSUNG_HEALTH_ATTEMPTS )); do
+    inspection=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}} {{.State.Status}} {{.State.ExitCode}}' "$container_id")
+    IFS=' ' read -r health status exit_code <<<"$inspection"
+    if [[ $health == healthy ]]; then
+      return 0
+    fi
+    if [[ $health == unhealthy ]]; then
+      HEALTH_ERROR='container reported unhealthy'
+      return 1
+    fi
+    if [[ $status == exited || $status == dead ]]; then
+      HEALTH_ERROR="container exited before becoming healthy (exit code ${exit_code:-unknown})"
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    sleep "$ATVR4SAMSUNG_HEALTH_DELAY_SECONDS"
+  done
+
+  HEALTH_ERROR='container did not become healthy before the deadline'
+  return 1
+}
+
+restore_image_and_restart() {
+  local source=$1
+  atomic_copy_file "$source" "$IMAGE_ENV" 600 || return 1
+  ensure_pinned_image_available "$IMAGE_ENV" || return 1
+  if ! compose_cmd up -d >/dev/null; then
+    HEALTH_ERROR='restore compose up failed'
+    return 1
+  fi
+  wait_for_service_health
+}
+
+restore_bundle_image_and_restart() {
+  restore_bundle_assets || return 1
+  atomic_copy_file "$BUNDLE_BACKUP_DIR/image.env" "$IMAGE_ENV" 600 || return 1
+  ensure_pinned_image_available "$IMAGE_ENV" || return 1
+  if ! compose_cmd up -d >/dev/null; then
+    HEALTH_ERROR='restore compose up failed'
+    return 1
+  fi
+  wait_for_service_health
+}
+
+cmd_install() {
+  local version=$1
+  local uid gid
+  validate_supported_version "$version"
+  require_runtime_prerequisites
+  require_gh_prerequisites
+  require_compose_assets
+  [[ ! -e $IMAGE_ENV && ! -L $IMAGE_ENV ]] ||
+    fail 'deployment metadata already exists; use upgrade instead of install'
+  download_verified_release_manifest "$version"
+  uid=$(current_uid)
+  gid=$(current_gid)
+  download_release_bundle "$version"
+  validate_staged_compose \
+    "$RESOLVED_REPO_DIGEST" \
+    "$RESOLVED_SOURCE_COMMIT" \
+    "$uid" \
+    "$gid"
+  ensure_install_layout "$BUNDLE_ASSET_DIR/config.example.yaml"
+  backup_bundle_assets || fail 'could not back up the current deployment bundle'
+  begin_bundle_transaction
+  if ! publish_bundle_assets; then
+    if restore_bundle_assets; then
+      finish_bundle_transaction
+      fail 'could not install the verified deployment bundle; original assets were restored'
+    fi
+    fail "could not install or restore deployment assets; backups remain at $BUNDLE_BACKUP_DIR"
+  fi
+  if ! publish_image_env \
+    "$RESOLVED_REPO_DIGEST" \
+    "$RESOLVED_SOURCE_COMMIT" \
+    "$uid" \
+    "$gid"; then
+    if restore_bundle_assets && remove_install_image_env; then
+      finish_bundle_transaction
+      fail 'could not publish deployment metadata; original assets were restored'
+    fi
+    fail "could not publish metadata or restore deployment assets; backups remain at $BUNDLE_BACKUP_DIR"
+  fi
+  ensure_private_file_mode "$IMAGE_ENV" 600
+  finish_bundle_transaction
+  printf 'Installed pinned image metadata for %s\n' "$RESOLVED_REPO_DIGEST"
+  printf 'Next: review %s\n' "$CONFIG_FILE"
+  printf 'Then run:\n  %s check\n  %s trust-tv\n  %s start\n' "$SELF_PATH" "$SELF_PATH" "$SELF_PATH"
+}
+
+cmd_upgrade() {
+  local version=$1
+  local old_image old_source old_uid old_gid
+  validate_supported_version "$version"
+  require_runtime_prerequisites
+  require_gh_prerequisites
+  require_deployment_state
+  require_current_image_env
+  old_image=$METADATA_IMAGE
+  old_source=$METADATA_SOURCE_COMMIT
+  old_uid=$METADATA_UID
+  old_gid=$METADATA_GID
+  download_verified_release_manifest "$version"
+  if [[ $RESOLVED_REPO_DIGEST == "$old_image" ]]; then
+    [[ $RESOLVED_SOURCE_COMMIT == "$old_source" ]] ||
+      fail 'current image metadata does not match the verified release source'
+    cleanup_bundle_workspace
+    trap - EXIT
+    printf 'Already running verified image %s; rollback metadata was unchanged.\n' "$old_image"
+    return 0
+  fi
+
+  download_release_bundle "$version"
+  validate_staged_compose \
+    "$RESOLVED_REPO_DIGEST" \
+    "$RESOLVED_SOURCE_COMMIT" \
+    "$old_uid" \
+    "$old_gid" \
+    "$old_image" \
+    "$old_source"
+  backup_bundle_assets || fail 'could not back up the current deployment bundle'
+  atomic_copy_file "$IMAGE_ENV" "$BUNDLE_BACKUP_DIR/image.env" 600 ||
+    fail 'could not back up deployment metadata'
+  begin_bundle_transaction
+  if ! publish_bundle_assets; then
+    if restore_bundle_assets; then
+      finish_bundle_transaction
+      fail 'could not install the target deployment bundle; original assets were restored'
+    fi
+    fail "could not install or restore deployment assets; backups remain at $BUNDLE_BACKUP_DIR"
+  fi
+  if ! publish_image_env \
+    "$RESOLVED_REPO_DIGEST" \
+    "$RESOLVED_SOURCE_COMMIT" \
+    "$old_uid" \
+    "$old_gid" \
+    "$old_image" \
+    "$old_source"; then
+    if restore_bundle_assets \
+       && atomic_copy_file "$BUNDLE_BACKUP_DIR/image.env" "$IMAGE_ENV" 600; then
+      finish_bundle_transaction
+      fail 'could not publish target metadata; original deployment was restored'
+    fi
+    fail "could not publish or restore deployment metadata; backups remain at $BUNDLE_BACKUP_DIR"
+  fi
+  if ensure_pinned_image_available "$IMAGE_ENV" \
+     && compose_cmd up -d >/dev/null \
+     && wait_for_service_health; then
+    finish_bundle_transaction
+    printf 'Upgraded to %s\n' "$RESOLVED_REPO_DIGEST"
+    return 0
+  fi
+
+  local upgrade_error=${HEALTH_ERROR:-upgrade start failed}
+  warn "Upgrade failed (${upgrade_error}); restoring the previous bundle and pinned image."
+  if restore_bundle_image_and_restart; then
+    finish_bundle_transaction
+    fail "upgrade failed (${upgrade_error}) and the previous deployment was restored"
+  fi
+  fail "upgrade failed (${upgrade_error}) and restoration also failed; recovery assets remain at $BUNDLE_BACKUP_DIR"
+}
+
+cmd_rollback() {
+  local current_image current_source current_uid current_gid
+  local previous_image previous_source
+  local rollback_error=''
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  require_previous_metadata
+
+  current_image=$METADATA_IMAGE
+  current_source=$METADATA_SOURCE_COMMIT
+  current_uid=$METADATA_UID
+  current_gid=$METADATA_GID
+  previous_image=$METADATA_PREVIOUS_IMAGE
+  previous_source=$METADATA_PREVIOUS_SOURCE_COMMIT
+  begin_rollback_transaction
+  if ! publish_image_env \
+    "$previous_image" \
+    "$previous_source" \
+    "$current_uid" \
+    "$current_gid" \
+    "$current_image" \
+    "$current_source"; then
+    rollback_error='could not publish rollback metadata'
+  elif ensure_pinned_image_available "$IMAGE_ENV" \
+       && compose_cmd up -d >/dev/null \
+       && wait_for_service_health; then
+    commit_rollback_transaction ||
+      fail 'rollback is healthy but its transaction could not be committed'
+    clear_rollback_transaction ||
+      fail 'rollback succeeded but its recovery state could not be cleared'
+    printf 'Rolled back to %s\n' "$previous_image"
+    return 0
+  else
+    rollback_error=${HEALTH_ERROR:-rollback start failed}
+  fi
+
+  warn "Rollback failed (${rollback_error}); restoring the previous current image."
+  if restore_image_and_restart "$ROLLBACK_BACKUP_ENV"; then
+    commit_rollback_transaction ||
+      fail 'rollback restoration is healthy but its transaction could not be committed'
+    clear_rollback_transaction ||
+      fail 'rollback restoration succeeded but its recovery state could not be cleared'
+    fail "rollback failed (${rollback_error}) and the previous current image was restored"
+  fi
+  fail "rollback failed (${rollback_error}) and restoration also failed; recovery metadata remains at $ROLLBACK_BACKUP_ENV"
+}
+
+cmd_start() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  ensure_pinned_image_available "$IMAGE_ENV" || fail "$HEALTH_ERROR"
+  compose_cmd up -d >/dev/null
+  wait_for_service_health || fail "$HEALTH_ERROR"
+  printf 'Container is healthy.\n'
+}
+
+cmd_check() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  ensure_pinned_image_available "$IMAGE_ENV" || fail "$HEALTH_ERROR"
+  compose_cmd run --rm -T "$ATVR4SAMSUNG_SERVICE" \
+    --config /config/config.yaml --check
+}
+
+cmd_doctor() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  ensure_pinned_image_available "$IMAGE_ENV" || fail "$HEALTH_ERROR"
+  compose_cmd run --rm -T "$ATVR4SAMSUNG_SERVICE" \
+    --config /config/config.yaml doctor
+}
+
+cmd_trust_tv() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  ensure_pinned_image_available "$IMAGE_ENV" || fail "$HEALTH_ERROR"
+  compose_cmd run --rm -T "$ATVR4SAMSUNG_SERVICE" \
+    --config /config/config.yaml trust-tv "$@"
+}
+
+cmd_pair() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  compose_cmd exec -T "$ATVR4SAMSUNG_SERVICE" \
+    atvr4samsung --config /config/config.yaml pair "$@"
+}
+
+cmd_paired_device() {
+  local command=$1
+  shift
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  compose_cmd exec -T "$ATVR4SAMSUNG_SERVICE" \
+    atvr4samsung --config /config/config.yaml "$command" "$@"
+}
+
+cmd_status() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_no_pending_transaction
+  require_current_image_env
+  compose_cmd ps
+}
+
+cmd_logs() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_no_pending_transaction
+  require_current_image_env
+  compose_cmd logs "$@"
+}
+
+cmd_restart() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  compose_cmd restart "$ATVR4SAMSUNG_SERVICE" >/dev/null
+  wait_for_service_health || fail "$HEALTH_ERROR"
+  printf 'Container restarted and is healthy.\n'
+}
+
+cmd_stop() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  compose_cmd stop >/dev/null
+  printf 'Container stopped.\n'
+}
+
+cmd_uninstall() {
+  require_runtime_prerequisites
+  require_deployment_state
+  require_current_image_env
+  compose_cmd down --remove-orphans >/dev/null
+  printf 'Containers removed. Retained:\n  %s\n  %s\n  %s\n' "$CONFIG_FILE" "$STATE_DIR" "$IMAGE_ENV"
+}
+
+cmd_migrate_native() {
+  local active='not-found'
+  local enabled='not-found'
+  local launcher='not-found'
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active atvr4samsung >/dev/null 2>&1; then
+      active='active'
+    else
+      active='inactive'
+    fi
+    if systemctl is-enabled atvr4samsung >/dev/null 2>&1; then
+      enabled='enabled'
+    else
+      enabled='disabled'
+    fi
+  fi
+
+  if launcher=$(command -v atvr4samsung 2>/dev/null); then
+    :
+  else
+    launcher='not-found'
+  fi
+
+  printf 'Native install discovery:\n'
+  printf '  systemd active : %s\n' "$active"
+  printf '  systemd enabled: %s\n' "$enabled"
+  printf '  launcher       : %s\n' "$launcher"
+  printf '\n'
+  printf 'No changes were made. Review and run this migration manually:\n'
+  printf '  1. Capture the current native config/state and stop using it for new changes.\n'
+  printf '  2. If the native service is active, stop it yourself: sudo systemctl stop atvr4samsung\n'
+  printf '  3. If the native service is enabled, disable it yourself after review: sudo systemctl disable atvr4samsung\n'
+  printf '  4. Install the container bundle: %s install X.Y.Z\n' "$SELF_PATH"
+  printf '  5. Review %s, run `%s trust-tv`, then `%s start`.\n' "$CONFIG_FILE" "$SELF_PATH" "$SELF_PATH"
+  printf '  6. Remove old native launchers only after the container deployment is verified.\n'
+}
+
+main() {
+  resolve_self
+  resolve_deploy_paths
+
+  local command=${1-}
+  if [[ -z $command ]]; then
+    usage >&2
+    exit 64
+  fi
+  shift || true
+
+  case "$command" in
+    install)
+      [[ $# -eq 1 ]] || fail 'install requires exactly one X.Y.Z version argument'
+      with_lock cmd_install "$1"
+      ;;
+    upgrade)
+      [[ $# -eq 1 ]] || fail 'upgrade requires exactly one X.Y.Z version argument'
+      with_lock cmd_upgrade "$1"
+      ;;
+    rollback)
+      [[ $# -eq 0 ]] || fail 'rollback does not accept extra arguments'
+      with_lock cmd_rollback
+      ;;
+    start)
+      [[ $# -eq 0 ]] || fail 'start does not accept extra arguments'
+      with_lock cmd_start
+      ;;
+    check)
+      [[ $# -eq 0 ]] || fail 'check does not accept extra arguments'
+      with_lock cmd_check
+      ;;
+    doctor)
+      [[ $# -eq 0 ]] || fail 'doctor does not accept extra arguments'
+      with_lock cmd_doctor
+      ;;
+    trust-tv)
+      with_lock cmd_trust_tv "$@"
+      ;;
+    pair)
+      with_lock cmd_pair "$@"
+      ;;
+    pairs)
+      [[ $# -eq 0 ]] || fail 'pairs does not accept extra arguments'
+      with_lock cmd_paired_device pairs
+      ;;
+    revoke)
+      [[ $# -eq 1 ]] || fail 'revoke requires exactly one paired-device identifier'
+      with_lock cmd_paired_device revoke "$1"
+      ;;
+    unpair)
+      with_lock cmd_paired_device unpair "$@"
+      ;;
+    status)
+      cmd_status
+      ;;
+    logs)
+      cmd_logs "$@"
+      ;;
+    restart)
+      [[ $# -eq 0 ]] || fail 'restart does not accept extra arguments'
+      with_lock cmd_restart
+      ;;
+    stop)
+      [[ $# -eq 0 ]] || fail 'stop does not accept extra arguments'
+      with_lock cmd_stop
+      ;;
+    uninstall)
+      [[ $# -eq 0 ]] || fail 'uninstall does not accept extra arguments'
+      with_lock cmd_uninstall
+      ;;
+    migrate-native)
+      [[ $# -eq 0 ]] || fail 'migrate-native does not accept extra arguments'
+      cmd_migrate_native
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage >&2
+      fail "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

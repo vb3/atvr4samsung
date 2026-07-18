@@ -1,0 +1,22 @@
+# Container deployment configuration. The deployment manager mounts persistent state at /data.
+# Copy to config.yaml, keep it mode 0600, and never commit the real TV details.
+
+companion:
+  device_name: "Frame Living Room"
+  port: 49152
+  model: "AppleTV14,1"
+  state_dir: "/data"
+
+samsung:
+  host: "192.168.1.50"
+  mac: "AA:BB:CC:DD:EE:FF"
+  port: 8002
+  name: "atvr4samsung"
+  token_file: "/data/samsung-token.txt"
+  wol:
+    enabled: true
+    broadcast: "192.168.1.255"
+    port: 9
+
+logging:
+  level: "INFO"

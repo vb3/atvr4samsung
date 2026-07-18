@@ -495,7 +495,7 @@ def _state_directory_message(path: Path) -> str:
 
 
 def _corrupt_store_message(path: Path) -> str:
-    # Leaving the corrupt file in place keeps systemd restarts failing closed; moving it aside would
+    # Leaving the corrupt file in place keeps supervisor restarts failing closed; moving it aside would
     # make the next start look unpaired and re-enable bootstrap pairing.
     return (
         f"paired-clients.json at {path} is corrupt or unreadable; refusing to start to avoid "

@@ -9,8 +9,7 @@ import socket
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from atvr4samsung import app
 from atvr4samsung.companion.protocol import atomic_io
@@ -323,233 +322,35 @@ class TestCmdPairedDevices(unittest.TestCase):
             self.assertIsNone(PairedClients(path).ltpk("phone-a"))
 
 
-class TestInstallServiceUnit(unittest.TestCase):
-    """The generated systemd unit must be hardened and must never run the service as root."""
+class TestHealthcheck(unittest.TestCase):
+    def test_requires_a_fixed_port(self):
+        config = _config(Path("/tmp/state"))
+        config.companion.port = 0
 
-    @contextlib.contextmanager
-    def _env(self, **overrides):
-        saved = {k: os.environ.get(k) for k in overrides}
-        try:
-            for k, v in overrides.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
-            yield
-        finally:
-            for k, v in saved.items():
-                if v is None:
-                    os.environ.pop(k, None)
-                else:
-                    os.environ[k] = v
+        self.assertEqual(_silently(app._cmd_healthcheck, config), 1)
 
-    def _generated_unit(self, config_path: str | None = None) -> str:
-        buf = io.StringIO()
-        if config_path is None:
-            config_path = str(Path(__file__).resolve().parents[1] / "atvr4samsung-test.yaml")
-        with contextlib.redirect_stdout(buf):
-            rc = app._cmd_install_service(config_path, apply=False)
-        self.assertEqual(rc, 0)
-        return buf.getvalue()
-
-    @staticmethod
-    def _parse_systemd_execstart(unit: str) -> list[str]:
-        """Parse the fully quoted subset emitted by the unit generator."""
-        line = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
-        encoded = line.removeprefix("ExecStart=")
-        arguments = []
-        index = 0
-        while index < len(encoded):
-            while index < len(encoded) and encoded[index] == " ":
-                index += 1
-            if index == len(encoded):
-                break
-            if encoded.startswith(r"\;", index):
-                arguments.append(";")
-                index += 2
-                continue
-            if encoded[index] != '"':
-                raise AssertionError(f"expected a quoted systemd argument at {encoded[index:]!r}")
-            index += 1
-            argument = []
-            while index < len(encoded) and encoded[index] != '"':
-                character = encoded[index]
-                if character == "\\":
-                    index += 1
-                    if index == len(encoded) or encoded[index] not in {'"', "\\"}:
-                        raise AssertionError("unexpected systemd backslash escape")
-                    argument.append(encoded[index])
-                elif character == "$":
-                    if encoded[index:index + 2] != "$$":
-                        raise AssertionError("unescaped systemd environment substitution")
-                    argument.append("$")
-                    index += 1
-                elif character == "%":
-                    if encoded[index:index + 2] != "%%":
-                        raise AssertionError("unescaped systemd specifier")
-                    argument.append("%")
-                    index += 1
-                else:
-                    argument.append(character)
-                index += 1
-            if index == len(encoded):
-                raise AssertionError("unterminated systemd argument")
-            arguments.append("".join(argument))
-            index += 1
-        return arguments
-
-    def test_refuses_direct_root_or_sudo_before_config_or_subprocess(self):
-        buf = io.StringIO()
+    def test_checks_tls_pin_and_local_listener(self):
+        config = _config(Path("/tmp/state"))
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
         with (
-            patch("atvr4samsung.app.os.geteuid", return_value=0),
-            patch("atvr4samsung.app.load_config") as load_config,
-            patch("subprocess.run") as run,
-            contextlib.redirect_stdout(buf),
+            patch("atvr4samsung.samsung.trust.load_trusted_certificate"),
+            patch("atvr4samsung.app.socket.create_connection", return_value=connection) as connect,
         ):
-            rc = app._cmd_install_service("/tmp/atvr4samsung-test.yaml", apply=True)
-        self.assertEqual(rc, 1)
-        load_config.assert_not_called()
-        run.assert_not_called()
-        self.assertIn("with sudo or as root", buf.getvalue())
+            self.assertEqual(_silently(app._cmd_healthcheck, config), 0)
 
-    def test_uses_effective_nonroot_user_not_sudo_user(self):
+        connect.assert_called_once_with(("127.0.0.1", config.companion.port), timeout=2.0)
+
+    def test_listener_failure_is_unhealthy(self):
+        config = _config(Path("/tmp/state"))
         with (
-            self._env(SUDO_USER="alice", USER="root"),
-            patch("atvr4samsung.app.os.geteuid", return_value=501),
+            patch("atvr4samsung.samsung.trust.load_trusted_certificate"),
             patch(
-                "atvr4samsung.app.pwd.getpwuid",
-                return_value=SimpleNamespace(pw_name="bob", pw_uid=501),
+                "atvr4samsung.app.socket.create_connection",
+                side_effect=OSError("connection refused"),
             ),
         ):
-            unit = self._generated_unit()
-        self.assertIn("User=bob", unit)
-        self.assertNotIn("User=alice", unit)
-
-    def test_refuses_invalid_passwd_account_data_before_rendering_user_directive(self):
-        for account in ("bob\nExecStart=/bin/false", "bad account"):
-            with self.subTest(account=account):
-                output = io.StringIO()
-                with (
-                    patch("atvr4samsung.app.os.geteuid", return_value=501),
-                    patch(
-                        "atvr4samsung.app.pwd.getpwuid",
-                        return_value=SimpleNamespace(pw_name=account, pw_uid=501),
-                    ),
-                    contextlib.redirect_stdout(output),
-                ):
-                    result = app._cmd_install_service("safe.yaml")
-
-                self.assertEqual(result, 1)
-                self.assertIn("invalid per-user service account", output.getvalue())
-                self.assertNotIn("User=bob", output.getvalue())
-                self.assertNotIn("ExecStart=/bin/false", output.getvalue())
-
-    def test_refuses_numeric_or_nonportable_passwd_account_names(self):
-        for account in ("0", "123", "9user", "user.name"):
-            with self.subTest(account=account):
-                output = io.StringIO()
-                with (
-                    patch("atvr4samsung.app.os.geteuid", return_value=501),
-                    patch(
-                        "atvr4samsung.app.pwd.getpwuid",
-                        return_value=SimpleNamespace(pw_name=account, pw_uid=501),
-                    ),
-                    contextlib.redirect_stdout(output),
-                ):
-                    result = app._cmd_install_service("safe.yaml")
-
-                self.assertEqual(result, 1)
-                self.assertIn("invalid per-user service account", output.getvalue())
-
-    def test_refuses_a_passwd_record_that_does_not_match_the_effective_uid(self):
-        output = io.StringIO()
-        with (
-            patch("atvr4samsung.app.os.geteuid", return_value=501),
-            patch(
-                "atvr4samsung.app.pwd.getpwuid",
-                return_value=SimpleNamespace(pw_name="bob", pw_uid=0),
-            ),
-            contextlib.redirect_stdout(output),
-        ):
-            result = app._cmd_install_service("safe.yaml")
-
-        self.assertEqual(result, 1)
-        self.assertIn("current unprivileged account", output.getvalue())
-
-    def test_execstart_preserves_special_path_arguments_as_one_literal_argv(self):
-        executable = '/opt/Frame TV/atvr"runner%$\\bin'
-        config = '/srv/Frame Config/config "quoted" % $ \\state.yaml'
-        expected = [
-            str(Path(executable).resolve()),
-            "--config",
-            str(Path(config).resolve()),
-        ]
-        with patch("atvr4samsung.app.shutil.which", return_value=executable):
-            unit = self._generated_unit(config)
-
-        execstart = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
-        self.assertEqual(self._parse_systemd_execstart(unit), expected)
-        self.assertIn(r'\"', execstart)
-        self.assertIn(r"\\", execstart)
-        self.assertIn("%%", execstart)
-        self.assertIn("$$", execstart)
-
-    def test_execstart_fallback_is_a_direct_python_module_argv(self):
-        with patch("atvr4samsung.app.shutil.which", return_value=None):
-            unit = self._generated_unit()
-
-        self.assertEqual(
-            self._parse_systemd_execstart(unit),
-            [
-                str(Path(app.sys.executable).resolve()),
-                "-m",
-                "atvr4samsung.app",
-                "--config",
-                str((Path(__file__).resolve().parents[1] / "atvr4samsung-test.yaml").resolve()),
-            ],
-        )
-
-    def test_rejects_control_character_injection_in_execstart_input(self):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            result = app._cmd_install_service("safe.yaml\nExecStart=/bin/false")
-
-        self.assertEqual(result, 1)
-        self.assertIn("unsafe systemd ExecStart", output.getvalue())
-        self.assertNotIn("ExecStart=/bin/false", output.getvalue())
-
-    def test_systemd_argument_encoder_rejects_nul_newline_and_other_controls(self):
-        for control in ("\x00", "\n", "\t", "\x7f", "\x85"):
-            with self.subTest(control=repr(control)):
-                with self.assertRaisesRegex(ValueError, "control characters"):
-                    app._systemd_exec_quote(f"/safe{control}path")
-
-    def test_unit_is_hardened_and_home_compatible(self):
-        with self._env(SUDO_USER=None, USER="bob"):
-            unit = self._generated_unit()
-        for directive in (
-            "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=full",
-            "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK", "RestrictNamespaces=true",
-        ):
-            self.assertIn(directive, unit)
-        # Must NOT lock out the home dir — per-user config/state live under $HOME.
-        self.assertNotIn("ProtectHome", unit)
-        self.assertNotIn("ProtectSystem=strict", unit)
-
-
-class TestReferenceSystemdUnit(unittest.TestCase):
-    """The dedicated-user reference must satisfy strict project state-directory validation."""
-
-    def test_state_directory_is_created_with_private_mode(self):
-        unit = (
-            Path(__file__).resolve().parents[1] / "systemd" / "atvr4samsung.service"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("StateDirectory=atvr4samsung\nStateDirectoryMode=0700", unit)
-        self.assertIn(
-            "install -d -o atvbridge -g atvbridge -m 0700 /var/lib/atvr4samsung",
-            unit,
-        )
+            self.assertEqual(_silently(app._cmd_healthcheck, config), 1)
 
 
 class TestConfigPathExpansion(unittest.TestCase):

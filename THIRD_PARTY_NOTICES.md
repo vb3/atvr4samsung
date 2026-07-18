@@ -25,12 +25,13 @@ This MIT text applies to all pyatv-derived code here.
 - License: GNU Lesser General Public License v3.0
 - We import it **unmodified** to talk to the Samsung TV's WebSocket remote API. Importing an
   unmodified LGPL library from MIT-licensed code does **not** relicense our code, **but**:
-  - We must keep the library **user-replaceable** (installed as a normal pip dependency — do not
-    fork-and-inline it), and
+  - We must keep the library **user-replaceable** (installed as an ordinary Python package in the
+    image, not forked/inlined; operators can build a derivative image with a replacement), and
   - Any redistribution must ship this notice and a copy of (or pointer to) the LGPL-3.0 text.
   - If this project is ever shipped as a **flashed appliance image** (e.g. a pre-baked SD card),
     LGPLv3 §6 "Installation Information" obligations may apply — provide the means for the user to
-    swap in a modified `samsungtvws`. Not applicable to a normal `pip install`.
+    swap in a modified `samsungtvws`. The published OCI image remains rebuildable from source and its
+    dependencies remain separate Python packages.
 
 LGPL-3.0 text: https://www.gnu.org/licenses/lgpl-3.0.html
 
@@ -41,8 +42,8 @@ LGPL-3.0 text: https://www.gnu.org/licenses/lgpl-3.0.html
 - Project: https://github.com/python-websockets/websockets
 - License: BSD-3-Clause
 - Imported directly by the Samsung pinned async transport. Version 15 or newer is required because
-  the transport explicitly disables ambient proxies for the TV's tokenized LAN URL; it remains an
-  ordinary user-replaceable pip dependency.
+  the transport explicitly disables ambient proxies for the TV's tokenized LAN URL; it remains a
+  separate replaceable Python package in the image.
 
 ---
 

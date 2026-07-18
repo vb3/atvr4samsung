@@ -1,7 +1,5 @@
 name: Release
 
-# Publish one immutable, versioned release for every strictly increasing X.Y.Z
-# project version. The release decision is pure and unit-tested.
 "on":
   push:
     branches: [main]
@@ -38,34 +36,53 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          read_version() { python -I -S -c "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])"; }
+          read_version() {
+            python -I -S -c \
+              "import sys,tomllib; print(tomllib.load(sys.stdin.buffer)['project']['version'])"
+          }
 
-          CUR="$(read_version < pyproject.toml)"
-          echo "Current version: $CUR"
-
-          # Previous version = pyproject.toml at the commit before this push. The zero-SHA means a
-          # brand-new branch / first push (no parent), so there is no previous version → skip.
-          PREV=""
-          if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+          current="$(read_version < pyproject.toml)"
+          previous=""
+          if [ -n "${BEFORE:-}" ] \
+             && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
-            PREV="$(git show "${BEFORE}:pyproject.toml" 2>/dev/null | read_version 2>/dev/null || true)"
-          fi
-          echo "Previous version: ${PREV:-<none>}"
-
-          DECISION="$(python -I -S scripts/release_decision.py "$PREV" "$CUR")"
-          TAG="v$CUR"
-
-          # Idempotency: never try to re-create an existing release/tag (e.g. on a re-run).
-          if [ "$DECISION" = "release" ] && gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists — skipping."
-            DECISION="skip"
+            previous="$(git show "${BEFORE}:pyproject.toml" 2>/dev/null | read_version 2>/dev/null || true)"
           fi
 
-          echo "Decision: $DECISION (tag $TAG)"
+          decision="$(python -I -S scripts/release_decision.py "$previous" "$current")"
+          tag="v${current}"
+          release_error="$(mktemp)"
+          if existing="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+              --jq 'if .draft then "draft" else "published" end' \
+              2>"$release_error"
+          )"; then
+            if [ "$existing" = "draft" ]; then
+              target="$(
+                gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+                  --jq .target_commitish
+              )"
+              target_commit="$(
+                gh api "repos/${GITHUB_REPOSITORY}/commits/${target}" --jq .sha
+              )"
+              test "$target_commit" = "$GITHUB_SHA"
+            fi
+          elif grep -Fq '(HTTP 404)' "$release_error"; then
+            existing="absent"
+          else
+            cat "$release_error" >&2
+            rm -f "$release_error"
+            exit 1
+          fi
+          rm -f "$release_error"
+          if [ "$decision" = "release" ] && [ "$existing" = "published" ]; then
+            decision="skip"
+          fi
+
           {
-            echo "release=$([ "$DECISION" = "release" ] && echo true || echo false)"
-            echo "version=$CUR"
-            echo "tag=$TAG"
+            echo "release=$([ "$decision" = "release" ] && echo true || echo false)"
+            echo "version=$current"
+            echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
 
   release:
@@ -73,10 +90,12 @@ jobs:
     if: needs.detect.outputs.release == 'true'
     permissions:
       contents: write
+      packages: write
       id-token: write
       attestations: write
     runs-on: ubuntu-latest
     env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
       TAG: ${{ needs.detect.outputs.tag }}
       VERSION: ${{ needs.detect.outputs.version }}
     steps:
@@ -90,7 +109,6 @@ jobs:
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
         with:
           version: "0.11.16"
-          # SHA-256 of astral-sh/uv 0.11.16's uv-x86_64-unknown-linux-gnu.tar.gz.
           checksum: "74947fe2c03315cf07e82ab3acc703eddef01aba4d5232a98e4c6825ec116131"
 
       - name: Install locked development environment
@@ -99,98 +117,278 @@ jobs:
       - name: Test gate
         run: uv run --frozen --no-sync python -m pytest -q
 
-      - name: Build wheel + sdist
+      - name: Validate Python package payload
         run: |
-          uv run --frozen --no-sync python -m build --no-isolation
+          set -euo pipefail
+          mkdir -p .package-validation
+          uv run --frozen --no-sync python -m build --no-isolation --outdir .package-validation
           uv run --frozen --no-sync python -m twine check \
-            "dist/atvr4samsung-${VERSION}-py3-none-any.whl" \
-            "dist/atvr4samsung-${VERSION}.tar.gz"
-
-      - name: Verify built artifacts match the version
-        run: |
-          set -euo pipefail
-          test -f "dist/atvr4samsung-${VERSION}-py3-none-any.whl"
-          test -f "dist/atvr4samsung-${VERSION}.tar.gz"
-          test "$(find dist -maxdepth 1 -name 'atvr4samsung-*-py3-none-any.whl' -type f | wc -l)" -eq 1
-          test "$(find dist -maxdepth 1 -name 'atvr4samsung-*.tar.gz' -type f | wc -l)" -eq 1
-
-      - name: Verify legal payload in release artifacts
-        run: |
-          set -euo pipefail
+            ".package-validation/atvr4samsung-${VERSION}-py3-none-any.whl" \
+            ".package-validation/atvr4samsung-${VERSION}.tar.gz"
           uv run --frozen --no-sync python -I -S scripts/verify_artifacts.py \
-            "dist/atvr4samsung-${VERSION}-py3-none-any.whl" \
-            "dist/atvr4samsung-${VERSION}.tar.gz"
+            ".package-validation/atvr4samsung-${VERSION}-py3-none-any.whl" \
+            ".package-validation/atvr4samsung-${VERSION}.tar.gz"
 
-      - name: Calculate runtime-lock asset name
-        id: release_asset_names
-        run: echo "runtime_lock=pylock.atvr4samsung-${VERSION//./-}.toml" >> "$GITHUB_OUTPUT"
-
-      - name: Export exact wheel-only PEP 751 runtime lock
+      - name: Package deployment bundle
         run: |
-          uv export \
-            --quiet \
-            --locked \
-            --no-dev \
-            --no-emit-project \
-            --no-emit-local \
-            --no-sources \
-            --no-build \
-            --format pylock.toml \
-            --output-file "dist/${{ steps.release_asset_names.outputs.runtime_lock }}"
-
-      - name: Package versioned installer and SHA-256 manifest
-        run: |
-          uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+          set -euo pipefail
+          mkdir -p dist
+          uv run --frozen --no-sync python -I -S scripts/container_bundle.py \
             --version "$VERSION" \
-            --dist-dir dist
-
-      - name: Verify complete release asset set
-        run: |
-          uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+            --output-dir dist
+          uv run --frozen --no-sync python -I -S scripts/container_bundle.py \
             --verify \
             --version "$VERSION" \
-            --dist-dir dist
+            --output-dir dist
 
-      - name: Extract release notes from CHANGELOG
+      - name: Install pinned Syft
         run: |
           set -euo pipefail
-          # Pull the "## [VERSION] ..." section body (up to the next "## [" header). Fall back to an
-          # empty file so the release step can use --generate-notes instead.
-          awk -v ver="$VERSION" '
-            $0 ~ ("^## \\[" ver "\\]") { capture = 1; next }
-            capture && /^## \[/ { exit }
-            capture { print }
-          ' CHANGELOG.md > notes.md || true
-          # Trim leading/trailing blank lines.
-          sed -i -e '/./,$!d' notes.md
-          echo "---- notes.md ----"; cat notes.md || true
+          mkdir -p .syft
+          archive="syft_1.48.0_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' \
+            --header 'Accept: application/octet-stream' \
+            --header 'Accept-Language: en-US,en;q=0.9' \
+            --output ".syft/$archive" \
+            "https://github.com/anchore/syft/releases/download/v1.48.0/$archive"
+          echo "6cef9a7f37220d9067eaf9cfaaa2fce986e9f320a8d42cbc36658c99af78ea04  .syft/$archive" \
+            | sha256sum --check -
+          tar -xzf ".syft/$archive" -C .syft syft
+          test "$(.syft/syft version -o json | jq -r .version)" = "1.48.0"
+
+      - name: Install pinned Buildx
+        run: |
+          set -euo pipefail
+          mkdir -p .buildx "$HOME/.docker/cli-plugins"
+          binary="buildx-v0.35.0.linux-amd64"
+          curl --fail --silent --show-error --location \
+            --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36' \
+            --header 'Accept: application/octet-stream' \
+            --header 'Accept-Language: en-US,en;q=0.9' \
+            --output ".buildx/$binary" \
+            "https://github.com/docker/buildx/releases/download/v0.35.0/$binary"
+          echo "d41ece72044243b4f58b343441ae37446d9c29a7d6b5e11c61847bbcf8f7dfda  .buildx/$binary" \
+            | sha256sum --check -
+          install -m 0755 ".buildx/$binary" "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version | grep -F 'v0.35.0'
+
+      # docker/setup-qemu-action v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
+      - name: Set up Buildx
+        run: |
+          docker buildx create \
+            --name atvr4samsung-release \
+            --driver docker-container \
+            --driver-opt image=moby/buildkit:buildx-stable-1@sha256:2f5adac4ecd194d9f8c10b7b5d7bceb5186853db1b26e5abd3a657af0b7e26ec \
+            --use
+          docker buildx inspect --bootstrap
+
+      # docker/login-action v4
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # docker/build-push-action v7
+      - name: Build and push multi-platform image
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          builder: atvr4samsung-release
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            VCS_REF=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve platform image digests
+        id: platforms
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            "${IMAGE_NAME}@${{ steps.image.outputs.digest }}" \
+            --raw > image-index.json
+          amd64="$(
+            jq -er '
+              [.manifests[]
+               | select(.platform.os == "linux" and .platform.architecture == "amd64")
+               | .digest]
+              | if length == 1 then .[0] else error("expected one linux/amd64 manifest") end
+            ' image-index.json
+          )"
+          arm64="$(
+            jq -er '
+              [.manifests[]
+               | select(.platform.os == "linux" and .platform.architecture == "arm64")
+               | .digest]
+              | if length == 1 then .[0] else error("expected one linux/arm64 manifest") end
+            ' image-index.json
+          )"
+          test "$amd64" != "$arm64"
+          {
+            echo "amd64=$amd64"
+            echo "arm64=$arm64"
+          } >> "$GITHUB_OUTPUT"
 
       # actions/attest v4.2.0, reviewed 2026-07-16
-      - name: Attest every versioned release asset
+      - name: Attest image provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
         with:
-          subject-path: |
-            dist/atvr4samsung-${{ env.VERSION }}-install.sh
-            dist/atvr4samsung-${{ env.VERSION }}-py3-none-any.whl
-            dist/atvr4samsung-${{ env.VERSION }}.tar.gz
-            dist/${{ steps.release_asset_names.outputs.runtime_lock }}
-            dist/atvr4samsung-${{ env.VERSION }}-sha256sums.txt
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
 
-      - name: Create GitHub Release
+      - name: Generate amd64 image SBOM
+        run: |
+          .syft/syft \
+            "registry:${IMAGE_NAME}@${{ steps.platforms.outputs.amd64 }}" \
+            --output "spdx-json=dist/atvr4samsung-${VERSION}-linux-amd64.spdx.json"
+
+      - name: Attest amd64 image SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.platforms.outputs.amd64 }}
+          sbom-path: dist/atvr4samsung-${{ env.VERSION }}-linux-amd64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Generate arm64 image SBOM
+        run: |
+          .syft/syft \
+            "registry:${IMAGE_NAME}@${{ steps.platforms.outputs.arm64 }}" \
+            --output "spdx-json=dist/atvr4samsung-${VERSION}-linux-arm64.spdx.json"
+
+      - name: Attest arm64 image SBOM
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.platforms.outputs.arm64 }}
+          sbom-path: dist/atvr4samsung-${{ env.VERSION }}-linux-arm64.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Verify public anonymous image access
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          runtime_lock="pylock.atvr4samsung-${VERSION//./-}.toml"
-          ASSETS=(
-            "dist/atvr4samsung-${VERSION}-install.sh"
-            "dist/atvr4samsung-${VERSION}-py3-none-any.whl"
-            "dist/atvr4samsung-${VERSION}.tar.gz"
-            "dist/${runtime_lock}"
-            "dist/atvr4samsung-${VERSION}-sha256sums.txt"
-          )
-          if [ -s notes.md ]; then
-            gh release create "$TAG" "${ASSETS[@]}" --title "$TAG" --notes-file notes.md --target "$GITHUB_SHA"
-          else
-            gh release create "$TAG" "${ASSETS[@]}" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+          package_name="${IMAGE_NAME##*/}"
+          if ! visibility="$(
+            gh api \
+              "users/${GITHUB_REPOSITORY_OWNER}/packages/container/${package_name}" \
+              --jq .visibility
+          )"; then
+            echo "::error::GHCR package ${IMAGE_NAME} is not publicly visible."
+            exit 1
           fi
+          if [ "$visibility" != "public" ]; then
+            echo "::error::GHCR package ${IMAGE_NAME} must be made public before publishing a release."
+            exit 1
+          fi
+          anonymous_config="$(mktemp -d)"
+          trap 'rm -rf "$anonymous_config"' EXIT
+          docker --config "$anonymous_config" pull \
+            "${IMAGE_NAME}@${{ steps.image.outputs.digest }}" >/dev/null
+
+      - name: Attest deployment bundle
+        id: deploy_attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: dist/atvr4samsung-${{ env.VERSION }}-deploy.tar.gz
+
+      - name: Publish deployment bundle attestation
+        run: |
+          cp -- \
+            "${{ steps.deploy_attestation.outputs.bundle-path }}" \
+            "dist/atvr4samsung-${VERSION}-deploy.sigstore.json"
+          chmod 0644 "dist/atvr4samsung-${VERSION}-deploy.sigstore.json"
+
+      - name: Create release manifest
+        run: |
+          set -euo pipefail
+          bundle_sha256="$(
+            sha256sum "dist/atvr4samsung-${VERSION}-deploy.tar.gz" | awk '{ print $1 }'
+          )"
+          {
+            printf 'ATVR4SAMSUNG_RELEASE_VERSION=%s\n' "$VERSION"
+            printf 'ATVR4SAMSUNG_RELEASE_IMAGE=%s@%s\n' \
+              "$IMAGE_NAME" "${{ steps.image.outputs.digest }}"
+            printf 'ATVR4SAMSUNG_RELEASE_SOURCE_COMMIT=%s\n' "$GITHUB_SHA"
+            printf 'ATVR4SAMSUNG_DEPLOY_BUNDLE_SHA256=%s\n' "$bundle_sha256"
+          } > "dist/atvr4samsung-${VERSION}-release.env"
+
+      - name: Attest release manifest
+        id: release_manifest_attestation
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: dist/atvr4samsung-${{ env.VERSION }}-release.env
+
+      - name: Publish release manifest attestation
+        run: |
+          cp -- \
+            "${{ steps.release_manifest_attestation.outputs.bundle-path }}" \
+            "dist/atvr4samsung-${VERSION}-release.sigstore.json"
+          chmod 0644 \
+            "dist/atvr4samsung-${VERSION}-release.env" \
+            "dist/atvr4samsung-${VERSION}-release.sigstore.json"
+
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          awk -v ver="$VERSION" '
+            $0 ~ ("^## \\[" ver "\\]") { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md > notes.md
+          sed -i -e '/./,$!d' notes.md
+          if [ ! -s notes.md ]; then
+            printf 'Container release %s.\n' "$TAG" > notes.md
+          fi
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "dist/atvr4samsung-${VERSION}-deploy.tar.gz"
+            "dist/atvr4samsung-${VERSION}-deploy.sigstore.json"
+            "dist/atvr4samsung-${VERSION}-release.env"
+            "dist/atvr4samsung-${VERSION}-release.sigstore.json"
+            "dist/atvr4samsung-${VERSION}-linux-amd64.spdx.json"
+            "dist/atvr4samsung-${VERSION}-linux-arm64.spdx.json"
+          )
+          if gh release view "$TAG" --json isDraft --jq .isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true"
+            target="$(gh release view "$TAG" --json targetCommitish --jq .targetCommitish)"
+            target_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${target}" --jq .sha)"
+            test "$target_commit" = "$GITHUB_SHA"
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --draft \
+              --title "$TAG" \
+              --notes-file notes.md \
+              --target "$GITHUB_SHA"
+          fi
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$TAG" --draft=false

@@ -42,102 +42,71 @@ src/atvr4samsung/
       server_identity.py stable per-install UUID + Ed25519 key + enrollment generation (persisted)
       paired_clients.py  PairedClients: persist/lookup client long-term public keys (pair-once enforcement)
       keyed_archiver.py  minimal NSKeyedArchiver reader (RTI/typed-character decode)
-scripts/                 install.sh (versioned release-installer template; cannot run unrendered)
-                         installer_asset_verifier.py (isolated descriptor verifier/stager embedded in releases)
-                         build.sh (locked local release-candidate builder)
-                         release_assets.py (versioned installer/runtime-lock/checksum generator + verifier)
+deploy/                  Compose model, container config template, and deployment manager
+scripts/                 container_bundle.py (deterministic deployment-bundle builder/verifier)
+Dockerfile               locked multi-stage amd64/arm64 OCI image
 tests/                   stdlib-runnable unit tests for the pure layers + protocol pieces
 ```
 
-### Release asset contract
+### Container release contract
 
-The release workflow builds exactly five versioned files for each stable `X.Y.Z`: an installer,
-wheel, sdist, wheel-only PEP 751 runtime lock, and SHA-256 manifest. The lock is named
-`pylock.atvr4samsung-X-Y-Z.toml`: pipx permits only one dot-free name segment after `pylock.`, so
-the semantic-version dots are encoded as hyphens. `scripts/release_assets.py` renders the installer
-with that version and embeds the stdlib-only `installer_asset_verifier.py`; the generated installer
-invokes its selected Python 3.11+ helper only with `-I -S`, so an
-asset-directory/current-directory `sitecustomize`, `usercustomize`, `PYTHONPATH`, or installed site
-package cannot execute while assets are checked. It requires an effective-user-owned directory at
-exact mode 0700 and opens every path component and asset without following symlinks. The directory
-must contain exactly those five
-expected names—no hidden/unexpected entries, subdirectories, devices, links, or another version.
-The verifier holds no-follow source descriptors while checking the manifest and PEP 751 lock,
-then copies those held bytes into newly created mode-0700/0600 staging objects under a validated
-effective-user-owned mode-0700 runtime root (or a root-owned sticky ancestor). It fsyncs the staged
-files/directories, then builds the complete five-asset set in a random private 0700 sibling beneath
-`${XDG_DATA_HOME:-$HOME/.local/share}/atvr4samsung/install-inputs/`. A descriptor-held advisory lock
-serializes publishers sharing that root; only after the files, directory, manifest, and runtime lock
-verify does it atomically rename the sibling to the version directory and fsync the parent. An
-explicit missing absolute `XDG_DATA_HOME` is descriptor-walked from its nearest validated existing
-ancestor and each missing component is created effective-user-owned 0700 with parent fsync, ACL
-clear/recheck, and no-follow validation. Persistent ancestors are descriptor-walked without symlinks;
-the project/version directories are effective-user-owned 0700, all five durable files are regular
-0600, and a same-version source must match held descriptors exactly. A concurrent publisher sees the
-complete final directory or none; a mismatch fails closed rather than replacing a potentially
-referenced path. Before any existing final directory is handed off, it strictly fsyncs the held
-input-root descriptor, allowing a retry to durably commit a visible rename after a prior sync
-failure. The shell removes transient staging before it `exec`s `install-with-lock`, which
-revalidates the retained manifest and runtime lock. It runs its fixed pipx argv, records private 0600
-`python-path` metadata immediately after pipx creates the venv and before app validation/`init`, then
-invalidates a same-version prior record before forced pipx can replace the venv, so metadata
-publication failure cannot leave it stale. The metadata lives in a namespace derived
-from validated `PIPX_HOME` descriptor identity (`st_dev`, `st_ino`) plus project, rooted at
-`$PIPX_HOME/.atvr4samsung-installer-state/`. It first creates/opens a no-follow regular lock file in
-that private 0700 state directory and holds `fcntl.flock(LOCK_EX)` through final durable
-verification, its exact fixed pipx argv, metadata publication, app executable check, and `init`. The
-helper runs each fixed child in a guarded process group with a parent-death pipe: direct
-HUP/INT/TERM cleans the group, and SIGKILL closes the pipe. The supervisor retains a duplicate of the
-lock's open description until that isolated group is terminated and reaped. The helper uses close-only
-release rather than `LOCK_UN`, so its timeout cleanup cannot unlock the supervisor's shared
-description. On shutdown, the supervisor signals the group, reaps the direct leader before inspecting
-the remaining group, then sends `SIGKILL` to residual descendants and retains the lock until their
-process group is gone; a zombie leader therefore cannot hold the lock indefinitely. The downstream
-pipx/app command receives no lock descriptor. A configured unsafe PIPX path or lock path fails before
-pipx. This
-isolates distinct pipx homes while preventing concurrent writers to one venv from mismatching its
-metadata. A custom home always derives private mode-0700/no-ACL direct `bin`, `man`, and
-`completions` children. An output override is accepted only when it redundantly names the exact
-derived held directory; it cannot select another descendant. The default home uses pipx's canonical
-standard paths. The helper passes only validated textual paths to pipx and checks `pipx environment`
-before and after its fixed install argv by reopening and comparing descriptor identities; it also
-rejects a custom path that collides with the current default output namespace by identity, so aliases
-share one home/project lock. The
-metadata file is parsed as one clean absolute path and output only with shell-safe
-quoting for the required
-`pipx reinstall --python … atvr4samsung` lifecycle; bare pipx reinstall does not retain the initial
-interpreter selection. The durable inputs remain for offline reinstall; incomplete unpublished
-siblings and all transient staging are removed through trusted parent descriptors. A complete
-atomically published version directory remains after an interrupted handoff.
-Darwin reads extended ACLs only through `acl_get_fd_np`/`acl_to_text` on the held descriptors:
-source and final runtime/staging/file objects reject ACLs, safe deny-only/read-only runtime ancestors
-remain usable, and newly created runtime/staging directories and staged files explicitly clear then
-recheck inherited ACLs before use. ACL API unsupported results are clean; any other read/clear failure
-fails closed. Before it opens a source asset descriptor, the helper installs its HUP/INT/TERM guard. Its
-handler only records the first signum, never raises asynchronously; explicit checkpoints select
-statuses 129, 130, and 143 only after new descriptors are inside a surrounding cleanup scope.
-The guard blocks signals before `mkdir`, ownership registration, staging-fd close, source cleanup,
-and path handoff; it also blocks them across every original-handler restoration. While blocked it
-consumes pending managed signals before deciding whether to remove the stage or handoff its flushed
-path, and it restores the original mask only after that decision is safe. Pipx therefore never
-reopens the downloaded asset pathname after validation. An explicit ownership record sets the staging
-fd to absent before closing it under the managed mask; the internal staging API refuses to retain a
-tree without a successful flushed handoff callback. It rejects editable/local/URL
-runtime lock entries without direct HTTPS wheel URLs and SHA-256 hashes, any source distribution, and
-the local project itself.
-Before a local candidate build, `scripts/build.sh` invokes the same strict `X.Y.Z` validator as the
-asset packager; only then does it remove prior `atvr4samsung` release assets from its selected output
-directory, so an invalid version cannot erase a valid set and a later version cannot select a stale one.
-The manifest hashes every file except itself; GitHub provenance attests all five, including the
-manifest. Operators resolve the selected tag and release target through the commits API, require the
-same full commit SHA, and pass it with `refs/heads/main` plus the exact signer workflow/repository to
-every `gh attestation verify` invocation. The rendered installer requires its own matching local
-asset directory, verifies that exact set and manifest before invoking pipx, then uses pipx 1.16's
-`--python <isolated-resolved-PYTHON3> --backend uv --lock` contract. The lock's direct
-SHA-256-pinned wheels install with indexes and source builds disabled; pipx then installs the
-durable application wheel without resolving
-dependencies and checks the completed environment before `init`. See `operations.md` §1 for the
-operator verification order.
+Each stable `X.Y.Z` release publishes one multi-platform OCI image and one deployment bundle:
+
+- `ghcr.io/vb3/atvr4samsung:X.Y.Z`, with `linux/amd64` and `linux/arm64` manifests;
+- GitHub provenance for the image index and SPDX SBOM attestations for each platform manifest; and
+- `atvr4samsung-X.Y.Z-deploy.tar.gz`, containing exactly `atvr4samsung-deploy`,
+  `compose.yaml`, and `config.example.yaml` beneath one versioned top-level directory;
+- an offline Sigstore bundle for the deployment archive; and
+- an offline-attested release manifest binding the version, source commit, exact image digest, and
+  deployment-bundle SHA-256.
+
+`scripts/container_bundle.py` produces deterministic USTAR+gzip bytes: sorted inventory, fixed
+uid/gid/names, normalized modes, and `SOURCE_DATE_EPOCH` timestamps. Verification rejects extra
+members, absolute/traversal names, links, devices, and unexpected metadata.
+
+The deployment manager accepts only strict `X.Y.Z` input. It anonymously downloads the matching
+release manifest and Sigstore bundle, strictly parses the manifest, then calls
+`gh attestation verify --bundle` with repository, signer workflow, source digest/ref, and
+hosted-runner constraints. The signed manifest binds the requested version to one
+`ghcr.io/vb3/atvr4samsung@sha256:...` digest and one deployment-bundle SHA-256. The manager checks
+that hash, pulls only the bound digest, persists the signed release record for pruned-image recovery,
+and writes `image.env` mode 0600 with the digest and host UID/GID. No GitHub account, token, API
+request, or registry login is required. The manager removes inherited Compose interpolation
+variables, validates the complete metadata schema, and checks the rendered Compose image before
+every operation. Compose uses `pull_policy: never`, so runtime startup cannot replace that verified
+local image with a registry lookup.
+
+Before release publication, CI requires the GHCR package to be public and proves an anonymous pull
+of the exact index digest. Release maintainers make the package public once in GitHub's package
+settings; the workflow does not require or accept a long-lived package-administration token. The
+repository's immutable-releases setting is maintained and verified out of band because reading that
+administration setting is intentionally outside `GITHUB_TOKEN` permissions.
+
+Mutating manager commands serialize with `flock` under a private deployment-state directory. Config
+and state are mode 0600/0700 and reject symlink/foreign ownership. Install and upgrade independently
+download and offline-verify the signed release metadata, validate the deployment bundle's bound hash,
+exact archive inventory, shell syntax, and rendered Compose image, then durably replace the
+manager/Compose assets. Upgrades
+save the prior assets and metadata, publish the new current and rollback digests together through one
+same-directory replacement, recreate the container, and wait for Docker health. Failure restores the
+exact prior bundle, metadata, and container. Rollback swaps both digests with the same single-file
+atomic replacement. Durable transaction markers make both bundle upgrades and manual rollback
+recover the pre-operation metadata *and running container* after process termination or power loss.
+Same-version upgrades are no-ops, and `install` refuses existing metadata.
+The in-place flow is deliberately same-major: every 2.x bundle must remain compatible with the 2.x
+metadata and generic swap/health contract; a future incompatible deployment contract requires a new
+major bundle and explicit migration. Uninstall removes containers only.
+
+The image is built from `uv.lock` in a multi-stage Dockerfile; the final image contains no uv/build
+tooling. The Dockerfile frontend, build/runtime bases, privileged QEMU binfmt image, and BuildKit daemon are
+all digest-pinned; QEMU and BuildKit setup occur before registry login. The Syft release archive is
+versioned and verified against a committed SHA-256 before either platform SBOM is generated, and the
+Buildx client is likewise versioned and checksum-pinned instead of installed by a mutable action.
+PEP 517 build requirements and their `packaging` dependency are exact-versioned and constrained to
+committed wheel URLs and SHA-256 hashes during the image build. The container runs as the
+Compose-selected host UID/GID with a read-only root, all capabilities dropped,
+`no-new-privileges`, a private tmpfs, read-only config, and only `/data` writable. Linux host
+networking is required for mDNS multicast and Wake-on-LAN broadcast.
 
 ## 2. Companion wire protocol
 
@@ -562,9 +531,9 @@ use `atvr4samsung pair`.
 
 **State (under required `companion.state_dir`, gitignored):** project-created state-directory
 components are mode 0700 with no extended ACL; existing final project state directories must also be
-effective-user-owned mode 0700. The dedicated-user reference unit explicitly uses
-`StateDirectoryMode=0700` so systemd-managed state meets this contract. Sensitive records and the
-persistent lock are mode 0600 with no extended ACL.
+effective-user-owned mode 0700. The deployment manager creates the host `state/` bind mount at mode
+0700 before Compose starts. Sensitive records and the persistent lock are mode 0600 with no extended
+ACL.
 - `server-identity.json` — stable per-install UUID + Ed25519 private key plus a random enrollment
   generation (pairing survives restarts).
 - `paired-clients.json` — up to eight client LTPKs (paired-client enforcement); its atomic-replace

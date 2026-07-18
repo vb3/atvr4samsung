@@ -43,7 +43,7 @@ WebSocket API.
 | **Companion server** | Emulated Apple TV: mDNS advertise, pairing (SRP-6a + Curve25519), encrypted session, decode `_hidC` buttons + `_hidT` touch/swipe + media-control frames; relay decisions + swipe hold-to-repeat. Its bounded, authorization-aware command lane preserves order without a task per input frame. | `companion/server.py`, `companion/dispatch.py`, `companion/relay.py`, `companion/repeater.py`, `companion/protocol/`, `companion/discovery.py` |
 | **Command mapper** | Pure decision logic: Apple button → Samsung `KEY_*`; swipe → discrete direction; play/pause toggle. No I/O, fully unit-tested. | `bridge/keymap.py`, `bridge/gestures.py` |
 | **Samsung client** | Async WebSocket control (Tizen `KEY_*`), exact-certificate-pinned TLS, 0600 token persistence, Wake-on-LAN magic packet; exclusively serializes connect/send/reconnect/close on its one socket and rechecks the dispatch owner's current authorization at the wire boundary. | `samsung/client.py`, `samsung/trust.py` |
-| **App / service** | Wire the above together, load config, advertise, run under systemd. | `app.py`, `config.py` |
+| **App / service** | Wire the above together, load config, advertise, and expose health/admin commands. | `app.py`, `config.py` |
 
 The split is deliberate: **decision-shaped logic is pure and dependency-free** (no Apple-protocol or
 network imports), so the parts most likely to have bugs (mapping, gesture thresholds, config
@@ -69,14 +69,14 @@ validation) are testable with the stdlib alone. I/O lives at the edges.
 
 ## 5. Deployment topology
 
-- **Target:** Raspberry Pi 4, single NIC, on the **IoT VLAN — the same subnet as the TV**. So the
-  Samsung WebSocket and the WoL packet are on-subnet (no NAT, no cross-subnet source checks).
+- **Target:** a Linux amd64/arm64 host (the Raspberry Pi 4 remains the reference), on the **IoT VLAN
+  — the same subnet as the TV**. So the Samsung WebSocket and WoL packet are on-subnet.
 - **Discovery across VLANs:** an existing mDNS reflector forwards `_companion-link._tcp` to the
   phone's VLAN; the phone already routes to the IoT VLAN.
-- **Process model:** one systemd service, one managed instance, auto-restart. Multiple paired phones
-  can overlap safely: each TCP connection owns its Companion session state, while all Samsung work
-  shares one bounded pipeline. Transport admission allows 16 total peers and at most eight before
-  authentication completes.
+- **Process model:** one digest-pinned Docker container with Compose restart management and Linux host
+  networking. Multiple paired phones can overlap safely: each TCP connection owns its Companion
+  session state, while all Samsung work shares one bounded pipeline. Transport admission allows 16
+  total peers and at most eight before authentication completes.
 
 ## 6. Security & privacy posture
 
@@ -148,47 +148,19 @@ validation) are testable with the stdlib alone. I/O lives at the edges.
 - **No secrets in git or logs.** The real `config.yaml` (TV IP/MAC and token paths), temporary
   enrollment PIN, Samsung token, and pairing keys are gitignored. DEBUG logs may show decoded
   *commands*, never PIN/keys.
-- **Verified immutable release installation.** Production installation begins with an operator
-  selecting an explicit `vX.Y.Z` GitHub Release, downloading its five versioned assets, and verifying
-  the tag and release target resolve to one immutable commit. GitHub's signed provenance for every
-  asset must claim that exact digest, `refs/heads/main`, and this repository's release workflow before
-  the installer executes. The attested SHA-256 manifest then binds the installer, wheel, sdist, and
-  exact wheel-only PEP 751 runtime lock locally. The installer accepts only that complete local asset
-  set and uses pipx's supported `--backend uv --lock` transaction to install the direct hashed runtime
-  wheels before its manifest-verified application wheel. Before parsing any asset,
-  its isolated verifier requires a current-effective-user-owned mode-0700 directory with exactly those
-  five non-symlink regular files, then copies only held descriptor bytes into a fresh trusted private
-  staging directory. It then constructs the complete verified five-asset set in a private temporary
-  sibling and atomically publishes that per-version `install-inputs` directory beneath validated XDG
-  data storage, so pipx's persisted metadata never points at transient staging or a partial directory.
-  Every reuse strictly fsyncs the held input-root descriptor before handoff, allowing a retry to
-  durably commit a visible rename after a prior sync failure.
-  Missing explicit XDG data-path components are created descriptor-relatively only below validated
-  safe ancestors. The locked helper rechecks the retained manifest before pipx consumes the wheel and
-  lock, then records the resolved descriptor-validated interpreter immediately after pipx creates the
-  venv and before `init`; a publication failure invalidates the old record. A downloaded asset parent
-  rename or durable substitution cannot redirect pipx. Source, runtime,
-  staging, persistent-input, and staged-file descriptors reject unsafe ACLs; newly created Darwin
-  objects clear and recheck inherited ACLs through their descriptors. The installer resolves its
-  isolated Python 3.11+ executable and passes it to pipx with `--python`; because pipx does not
-  persist that choice for bare reinstall, it prints the required interpreter-preserving reinstall
-  command. Before final verification it serializes every state-changing pipx transaction with a
-  private advisory lock keyed to validated `PIPX_HOME` descriptor identity plus project; it retains that lock
-  through pipx, the per-pipx-home interpreter record, and `init`. After materialization the shell
-  removes staging and `exec`s this lock owner; each command supervisor retains a duplicate of the
-  lock's open description until its isolated child group is terminated and reaped, without passing
-  that descriptor to pipx or the app. The helper closes its descriptor without `LOCK_UN`, so it cannot
-  unlock the supervisor's shared open description. The supervisor reaps its direct child before
-  checking residual group membership, preventing that child's zombie from retaining the lock; it
-  kills residual descendants and retains the lock until their process group is gone. Before it opens any
-  source descriptor, the verifier installs a HUP/INT/TERM guard whose handlers only record
-  interruption. Explicit safe checkpoints convert that record to the signal-style nonzero status only
-  after acquired descriptors are covered by cleanup. The guard blocks every staging ownership/handoff
-  transition and original
-  disposition restoration, drains pending signals before restoring the final mask, removes an
-  interrupted staged tree through the held runtime descriptor, and permits the original mask only
-  after removal or a flushed path handoff to the shell.
-  It has no moving release, branch, raw-script, Git, or source fallback.
+- **Verified immutable container installation.** Production installation begins with an operator
+  selecting an explicit immutable `vX.Y.Z` GitHub Release and verifying its single deployment bundle.
+  The manager anonymously downloads an offline-attested release manifest that binds the requested
+  version, source commit, exact OCI digest, and deployment-bundle SHA-256. It verifies the Sigstore
+  bundle against `refs/heads/main`, this repository, the release workflow, the declared source
+  commit, and GitHub-hosted runners, then pulls only the bound digest. No GitHub account or token is
+  required. Only the verified digest is written to Compose metadata, and the signed release record
+  is retained for pruned-image recovery. Install and upgrade metadata changes are serialized by a
+  private lock and published with same-directory replacement; failed verification leaves the active
+  digest untouched, while failed health after upgrade restores the prior digest. The workflow also
+  publishes and attests one SBOM for each platform manifest, and it proves an anonymous digest pull
+  before publishing the GitHub Release. There is no moving release, raw-script, source checkout,
+  native package-manager, or tag-at-runtime fallback.
 - **Pinned Samsung transport.** The daemon accepts only TLS port 8002. Before it can connect, an
   operator explicitly reviews and approves the TV's certificate with `atvr4samsung trust-tv`; the
   exact 0600 PEM pin lives under `companion.state_dir`. Each live WebSocket uses a
@@ -197,8 +169,10 @@ validation) are testable with the stdlib alone. I/O lives at the edges.
   startup never silently trusts on first use. The bootstrap command sends no token or WebSocket
   request. Port 8001/plaintext is rejected, and noisy Samsung/WebSocket dependency diagnostics are
   quarantined because they can serialize bearer URLs, commands, and RTI text.
-- **Least privilege.** systemd unit locks the process down (see `systemd/` and `operations.md`); bind
-  only the Companion TCP port and mDNS.
+- **Least privilege.** The container runs as the host operator UID/GID with a read-only root,
+  dropped capabilities, `no-new-privileges`, private temporary storage, read-only config, and only
+  private state writable. Host networking is required for mDNS/WoL and is the explicit remaining
+  isolation trade-off.
 
 ## 7. Key design decisions (and why)
 
@@ -211,7 +185,7 @@ validation) are testable with the stdlib alone. I/O lives at the edges.
 | **Samsung via `samsungtvws` + `websockets` (LGPL/BSD)** | `samsungtvws` remains imported unmodified and user-replaceable; our narrow TLS adapter directly uses the supported `websockets>=15` transport API. |
 | **Explicit Samsung certificate pin** | Frames commonly present a self-signed certificate. A two-step `trust-tv` review/approval writes one exact PEM pin atomically (0600); the actual production WebSocket validates TLS against it and checks the live leaf again. This avoids both unverified TLS and startup TOFU. |
 | **Five-minute enrollment PIN, persisted identity** | No bootstrap PIN is left valid in config: legacy `companion.pin` must be removed. `pair` creates a fresh, non-weak four-digit PIN and expiry with a strict durable atomic replacement, binds the window to the already-persisted server identity, and only displays it after that commit. A running service sees ordinary replacement windows without restart. Ordinary unpair checkpoints and recovers only enrollment/client state, preserving that identity; an identity reset checkpoint instead revokes old authority and requires startup recovery to clear all old state, strictly persist a replacement identity, rotate its identity-derived mDNS TXT records, and clear its marker before enrollment can reopen. When iOS probes the replacement with Pair-Verify before falling back to Pair-Setup on the same connection, only that window-gated fallback transition is accepted and its abandoned verify keys are erased. The same window admits multiple devices until expiry, while stable identity keeps existing verification working. |
-| **Versioned assets + provenance + pipx, no `.deb`** | A named release asset set is independently verifiable with GitHub provenance and local SHA-256 checks before the installer runs. The canonical flow creates a fresh effective-user-owned 0700 asset directory; an isolated, no-follow verifier copies its held inventory into trusted staging, atomically publishes the complete verified set under private XDG inputs, then removes staging before `exec`ing the lock-owning helper. It stores the private lock and per-pipx-home interpreter metadata under validated `PIPX_HOME/.atvr4samsung-installer-state/`, and locks the physical `PIPX_HOME` descriptor identity (`st_dev`, `st_ino`) + project namespace across final verification, pipx, metadata publication, executable validation, and `init`. A custom home always derives private direct `bin`/`man`/`completions` children; output overrides are accepted only when they reopen the same held directory, and a custom/default collision is rejected by descriptor identity, so aliases cannot split a lock or launcher namespace. Missing explicit XDG components are only created beneath validated safe ancestors. Guarded child process groups observe helper death, so direct signals cannot strand a pipx/app descendant. Pipx keeps the app isolated; its `--python` + `--backend uv --lock` transaction installs the release's exact wheel-only PEP 751 runtime lock rather than resolving at install time, while the printed reinstall command repeats `--python`. The generated unit passes a direct, systemd-escaped argv rather than a shell command. See `operations.md`. |
+| **Digest-pinned OCI image + one deployment bundle** | A multi-platform image contains the locked runtime and normal dynamically imported dependencies. The attested bundle provides the Compose contract and manager; the manager verifies the exact image digest before publishing it, then health-gates upgrades with rollback. This removes host Python/package/service-manager installation while retaining immutable provenance. See `operations.md`. |
 
 ## 8. Licensing boundary
 
