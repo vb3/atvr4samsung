@@ -1,50 +1,73 @@
 #!/usr/bin/env bash
-# Build the atvr4samsung wheel into dist/ with pip, in a throwaway virtualenv.
+# Build a local release-candidate asset set from the committed uv.lock.
 #
-#   bash scripts/build.sh                          # -> dist/atvr4samsung-<ver>-py3-none-any.whl
-#   PYTHON=/path/to/python3.13 bash scripts/build.sh
-#
-# Why a throwaway venv: a uv-managed .venv has no pip, and a stale system pip (e.g. Xcode's 21.x) is
-# too old to read this project's PEP 621 metadata — it silently builds a bogus UNKNOWN-0.0.0 wheel.
-# So we create a fresh venv from a >=3.11 interpreter, upgrade pip inside it, and build there. The
-# package is pure Python, so the wheel is portable (build on a dev box, copy to the Pi). To deploy it
-# to a running host: pipx install --force the wheel + restart the service (docs/operations.md §9).
+# This is for development and CI validation. Canonical production installation
+# uses the attested, versioned GitHub Release assets documented in README.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# Pick a >=3.11 interpreter: explicit $PYTHON, else the project's uv venv, else python3.
-if [ -n "${PYTHON:-}" ]; then
-  BASE_PYTHON="$PYTHON"
-elif [ -x ".venv/bin/python" ]; then
-  BASE_PYTHON=".venv/bin/python"
-else
-  BASE_PYTHON="python3"
-fi
+say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 64
+}
 
-if ! "$BASE_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-  echo "error: need Python >= 3.11 to build (got '$("$BASE_PYTHON" --version 2>&1)')." >&2
-  echo "       Set PYTHON to a 3.11+ interpreter, e.g. PYTHON=python3.13 bash scripts/build.sh" >&2
-  exit 1
-fi
+command -v uv >/dev/null 2>&1 || die "uv is required to build from the committed lock"
 
-BUILD_DIR="$(mktemp -d)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
-BUILD_PYTHON="$BUILD_DIR/venv/bin/python"
+say "Synchronizing the locked development environment"
+uv sync --all-extras --locked
 
-echo "==> Creating an isolated build venv ($("$BASE_PYTHON" --version 2>&1))"
-"$BASE_PYTHON" -m venv "$BUILD_DIR/venv"
-"$BUILD_PYTHON" -m pip install --quiet --upgrade pip
+version="$(
+  uv run --frozen --no-sync python -I -S -c \
+    'import sys,tomllib; print(tomllib.load(sys.stdin.buffer)["project"]["version"])' \
+      < pyproject.toml
+)"
+lock_version="${version//./-}"
 
-echo "==> Cleaning old wheels/sdists in dist/"
-rm -f dist/atvr4samsung-*.whl dist/atvr4samsung-*.tar.gz
+say "Validating the strict release version before touching output"
+uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+  --validate-version \
+  --version "$version"
 
-echo "==> Building wheel"
-"$BUILD_PYTHON" -m pip wheel . --no-deps --wheel-dir dist
+out_dir="${OUT_DIR:-dist}"
+[[ "$out_dir" != http://* && "$out_dir" != https://* && "$out_dir" != *://* ]] ||
+  die "OUT_DIR must be a local directory"
+mkdir -p "$out_dir"
 
-WHEEL="$(ls -t dist/atvr4samsung-*-py3-none-any.whl 2>/dev/null | head -1 || true)"
-if [ -z "${WHEEL}" ]; then
-  echo "error: build reported success but no atvr4samsung wheel landed in dist/." >&2
-  exit 1
-fi
-echo "==> Built ${WHEEL}"
+say "Removing stale generated release assets"
+uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+  --clean \
+  --version "$version" \
+  --dist-dir "$out_dir"
+
+say "Building wheel and sdist from the locked environment"
+uv run --frozen --no-sync python -m build --no-isolation --outdir "$out_dir"
+
+say "Exporting exact wheel-only PEP 751 runtime lock"
+uv export \
+  --quiet \
+  --locked \
+  --no-dev \
+  --no-emit-project \
+  --no-emit-local \
+  --no-sources \
+  --no-build \
+  --format pylock.toml \
+  --output-file "${out_dir}/pylock.atvr4samsung-${lock_version}.toml"
+
+say "Rendering the versioned installer and SHA-256 manifest"
+uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+  --version "$version" \
+  --dist-dir "$out_dir"
+
+say "Verifying release artifacts and their legal payload"
+uv run --frozen --no-sync python -I -S scripts/release_assets.py \
+  --verify \
+  --version "$version" \
+  --dist-dir "$out_dir"
+uv run --frozen --no-sync python -I -S scripts/verify_artifacts.py \
+  "${out_dir}/atvr4samsung-${version}-py3-none-any.whl" \
+  "${out_dir}/atvr4samsung-${version}.tar.gz"
+
+say "Built verified local release-candidate assets in ${out_dir}"

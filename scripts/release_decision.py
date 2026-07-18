@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Decide whether a version change is a release-worthy MINOR (or major) bump.
+"""Decide whether a version change is a release-worthy immutable release.
 
-The release workflow publishes a wheel only when the version's ``(major, minor)`` increases — i.e. a
-new ``X.Y.0`` — and skips routine patch (``z``) bumps, which happen on every commit. The comparison
-lives here (a pure, unit-tested function) rather than inline in YAML so the gate is verifiable.
+The release workflow publishes every strictly increasing ``X.Y.Z`` version, including a patch-only
+security update. The comparison lives here (a pure, unit-tested function) rather than inline in YAML
+so the gate is verifiable.
 
 CLI (used by ``.github/workflows/release.yml``)::
 
@@ -18,34 +18,39 @@ import sys
 from typing import Optional, Tuple
 
 
-def _major_minor(version: str) -> Optional[Tuple[int, int]]:
-    """Return ``(major, minor)`` from an ``X.Y[.Z[...]]`` string, or None if it can't be parsed.
+def _release_version(version: str) -> Optional[Tuple[int, int, int]]:
+    """Return ``(major, minor, patch)`` from an ``X.Y.Z`` string, or None if invalid.
 
-    Only the major and minor fields drive the decision, so any patch suffix (``0.1.0.dev1``,
-    ``0.1.0-rc1``) is ignored. Non-numeric major/minor → None (caller treats as "skip").
+    Versioned installer filenames intentionally support stable three-component releases only, so
+    pre-release/build suffixes fail closed instead of accidentally creating an ambiguous asset set.
     """
     if not version:
         return None
     parts = version.strip().split(".")
-    if len(parts) < 2:
+    if len(parts) != 3:
         return None
     try:
-        return int(parts[0]), int(parts[1])
+        if any(
+            not part.isdigit() or (len(part) > 1 and part.startswith("0"))
+            for part in parts
+        ):
+            return None
+        return int(parts[0]), int(parts[1]), int(parts[2])
     except ValueError:
         return None
 
 
 def should_release(prev: Optional[str], cur: str) -> bool:
-    """True iff ``cur``'s (major, minor) is strictly greater than ``prev``'s.
+    """True iff ``cur``'s numeric release version is strictly greater than ``prev``'s.
 
-    Patch-only bumps (``0.1.0`` → ``0.1.1``) return False. A missing/empty/unparseable ``prev`` (or
-    ``cur``) returns False — we never publish when the previous state is unknown.
+    A missing/empty/unparseable ``prev`` (or ``cur``) returns False — we never publish when the
+    previous state is unknown.
     """
-    cur_mm = _major_minor(cur)
-    prev_mm = _major_minor(prev or "")
-    if cur_mm is None or prev_mm is None:
+    cur_version = _release_version(cur)
+    prev_version = _release_version(prev or "")
+    if cur_version is None or prev_version is None:
         return False
-    return cur_mm > prev_mm
+    return cur_version > prev_version
 
 
 def main(argv: list[str]) -> int:

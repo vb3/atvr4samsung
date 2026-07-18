@@ -36,6 +36,16 @@ LGPL-3.0 text: https://www.gnu.org/licenses/lgpl-3.0.html
 
 ---
 
+## websockets — BSD-3-Clause (runtime dependency)
+
+- Project: https://github.com/python-websockets/websockets
+- License: BSD-3-Clause
+- Imported directly by the Samsung pinned async transport. Version 15 or newer is required because
+  the transport explicitly disables ambient proxies for the TV's tokenized LAN URL; it remains an
+  ordinary user-replaceable pip dependency.
+
+---
+
 ## zeroconf — LGPL-2.1 (runtime dependency)
 
 - Project: https://github.com/python-zeroconf/python-zeroconf
@@ -59,6 +69,16 @@ LGPL-2.1 text: https://www.gnu.org/licenses/lgpl-2.1.html
 - Project: https://github.com/remcohaszing/pywakeonlan
 - License: MIT
 - Used to send the Wake-on-LAN magic packet to power the TV on.
+
+---
+
+## Development tooling — MIT / Apache-2.0 (not shipped)
+
+- `build` (MIT), `setuptools` (MIT), and `wheel` (MIT) build the wheel and source distribution in
+  the locked development environment.
+- `twine` (Apache-2.0) checks the built distribution metadata before release.
+- These tools are development-only dependencies, imported unmodified and not included in the
+  distributed application.
 
 ---
 
