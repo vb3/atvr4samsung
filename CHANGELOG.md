@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [1.1.0] - 2026-07-18
+
+### Added
+
+- Added controlled multi-device enrollment for up to eight iPhones: an operator opens a durable
+  five-minute window with `atvr4samsung pair`, iOS receives a compatible four-digit PIN, and
+  `pairs`, `revoke`, and `unpair` provide per-device and clear-all administration.
+- Added persistent Companion identities with identity-bound mDNS records, crash-recoverable reset
+  checkpoints, and the iOS Pair-Verify-to-Pair-Setup fallback required after an identity reset.
+
+### Security
+
+- Isolated all Companion connection/session state, bounded frame sizes, connection counts,
+  authentication time, malformed input, and costly SRP starts, and made authentication phase and
+  replay handling explicitly fail closed.
+- Persisted and revalidated each controller's long-term key through encrypted frame receipt, bounded
+  dispatch, reconnect, and final Samsung wire I/O so revocation takes effect before the next command.
+- Hardened state storage with private ownership/mode/ACL validation, no-follow descriptor-relative
+  access, atomic replacement, directory fsync, and crash-safe recovery fences.
+- Added explicit Samsung TLS leaf approval, certificate-required partial-chain validation, exact
+  post-handshake DER pinning, private token writes, and dependency-log quarantine/redaction.
+- Replaced mutable release/install inputs with provenance-bound five-asset releases, a wheel-only
+  PEP 751 runtime lock, offline pipx installation, private staging, descriptor-scoped transaction
+  locks, signal-safe cleanup, legal-payload checks, and a forced private installer umask.
+
+### Changed
+
+- Serialized Samsung commands through one bounded, ordered, authorization-aware dispatch lane with
+  safe reconnect/retry behavior, stale-session cancellation, and bounded hold-repeat work.
+- Made the Companion service first-party and expanded protocol compatibility, iOS remote-session
+  handling, discovery refresh, keyboard/gesture behavior, diagnostics, and systemd hardening.
+- Expanded hardware-free regression coverage and updated the design, operations, security, and
+  release documentation for the supported final architecture.
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

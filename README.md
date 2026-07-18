@@ -76,7 +76,7 @@ Install Python 3.11+ as `python3`, `gh`, `pipx` 1.16.0 (or a compatible newer re
 `gh` verifies GitHub-issued provenance; the installer deliberately does not bootstrap any of these
 tools from an unverified network source.
 
-First inspect published releases and deliberately select one. The example below pins `0.14.0`; it is
+First inspect published releases and deliberately select one. The example below pins `1.1.0`; it is
 an example only — choose the reviewed version you intend to operate.
 
 ```bash
@@ -86,7 +86,7 @@ gh release list --repo vb3/atvr4samsung --limit 20
 (
   set -euo pipefail
 
-  VERSION=0.14.0                 # copy the reviewed published version exactly
+  VERSION=1.1.0                  # copy the reviewed published version exactly
   [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     { printf 'invalid stable release version: %s\n' "${VERSION}" >&2; exit 64; }
   TAG="v${VERSION}"
@@ -274,7 +274,7 @@ restart — a restart alone intentionally does not repair fail-closed identity c
 
 **Migration and limits:** remove any legacy `companion.pin` from an existing config — static PINs are
 rejected — and use `atvr4samsung pair` whenever a trusted phone needs enrollment. Before the first
-0.14.0 start, run the two-step `trust-tv` workflow: existing Samsung tokens are not TLS trust, and
+1.1.0 start, run the two-step `trust-tv` workflow: existing Samsung tokens are not TLS trust, and
 the service will not silently trust a certificate on first use. Up to eight phones
 may be paired. The service admits at most 16 TCP peers (eight still authenticating), requires
 authentication within 15 seconds, and routes every accepted remote command through one bounded

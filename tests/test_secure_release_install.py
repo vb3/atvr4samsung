@@ -4125,11 +4125,11 @@ tag_commit() {
 }
 if [ "${1:-}" = "api" ]; then
   endpoint="${2:-}"
-  if [ "$endpoint" = "repos/vb3/atvr4samsung/commits/v0.14.0" ]; then
+  if [ "$endpoint" = "repos/vb3/atvr4samsung/commits/v1.1.0" ]; then
     tag_commit
     exit 0
   fi
-  if [ "$endpoint" = "repos/vb3/atvr4samsung/releases/tags/v0.14.0" ]; then
+  if [ "$endpoint" = "repos/vb3/atvr4samsung/releases/tags/v1.1.0" ]; then
     printf '%s\\n' "${FAKE_RELEASE_TARGET:?}"
     exit 0
   fi
@@ -4485,7 +4485,7 @@ class TestReleaseHardeningDocumentationAndWorkflow(unittest.TestCase):
                     self.assertIn(
                         "trap 'handle_release_signal 143' TERM", contents
                     )
-                    self.assertIn("VERSION=0.14.0", contents)
+                    self.assertIn("VERSION=1.1.0", contents)
                 self.assertNotRegex(contents, r"curl[^\n|]*\|\s*bash")
                 self.assertNotIn("releases/latest", contents)
                 self.assertNotIn("raw.githubusercontent.com", contents)

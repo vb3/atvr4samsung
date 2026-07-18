@@ -25,7 +25,7 @@ Pass `--config <path>` only when you intentionally keep the config somewhere els
 
 ### 1a. Discover, pin, verify provenance, then execute
 
-First discover published releases and select a version deliberately. The commands use `0.14.0` as a
+First discover published releases and select a version deliberately. The commands use `1.1.0` as a
 concrete example only; copy the reviewed published version exactly. Never substitute a moving release
 alias, a branch name, raw repository content, or a Git URL.
 
@@ -36,7 +36,7 @@ gh release list --repo vb3/atvr4samsung --limit 20
 (
   set -euo pipefail
 
-  VERSION=0.14.0                 # set this to the chosen immutable release version
+  VERSION=1.1.0                  # set this to the chosen immutable release version
   [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     { printf 'invalid stable release version: %s\n' "${VERSION}" >&2; exit 64; }
   TAG="v${VERSION}"
@@ -303,9 +303,9 @@ per-user installer rejects root before reading user-owned config/token/pin state
 
 ### Breaking migration from static PINs and unpinned Samsung TLS
 
-If upgrading an older configuration, **delete `companion.pin`** before starting 0.14.0; the
+If upgrading an older configuration, **delete `companion.pin`** before starting 1.1.0; the
 config check rejects it instead of silently retaining a permanent bootstrap secret. Ensure
-`companion.state_dir` points to a private persistent directory. Before restarting 0.14.0,
+`companion.state_dir` points to a private persistent directory. Before restarting 1.1.0,
 run the two-step `trust-tv` approval above: an existing Samsung bearer token is **not** certificate
 trust and cannot bypass the pin. Then start the service and run `atvr4samsung pair` when a trusted
 phone is ready. That command creates the only enrollment PIN: a fresh four-digit value accepted by
@@ -387,7 +387,7 @@ has been fsynced; if it
 reports a durable-clear error, retry the command before treating the revocation/reset as complete.
 The window, paired-client clear, and identity reset share one transaction lock with enrollment M5
 persistence, so a pairing that completes before `unpair` is cleared and one that reaches M5 afterward
-is rejected. Restart 0.14.0 once before reopening enrollment so persisted identities gain their
+is rejected. Restart 1.1.0 once before reopening enrollment so persisted identities gain their
 binding; generation-less or server-unbound windows intentionally fail closed.
 
 **Transport and delivery limits:** the bridge admits at most **16** Companion TCP peers at once, with
@@ -430,7 +430,7 @@ Do not use a raw script URL, a moving release alias, a Git branch, an editable c
 unlocked `pipx install` for an upgrade. The installer intentionally rejects those inputs. Every
 stable patch release is publishable, so security fixes do not require choosing a source checkout.
 
-`config.yaml` and the state dir are untouched by an upgrade. On the first upgrade to 0.14.0, create
+`config.yaml` and the state dir are untouched by an upgrade. On the first upgrade to 1.1.0, create
 the required TLS pin with §2a **before** restarting; later upgrades preserve that pin. If the service
 is slow to stop on restart (the asyncio server can take a few seconds on SIGTERM), that's expected.
 
