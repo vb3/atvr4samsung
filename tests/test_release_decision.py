@@ -5,6 +5,7 @@ directory to ``sys.path`` before importing. Stdlib only — no package or networ
 """
 import os
 from pathlib import Path
+import re
 import sys
 import tomllib
 import unittest
@@ -64,6 +65,34 @@ class TestReleaseArtifactMetadata(unittest.TestCase):
         )
         self.assertIn("setuptools>=77", config["build-system"]["requires"])
         self.assertIn("setuptools>=77", config["project"]["optional-dependencies"]["dev"])
+
+
+class TestReleaseArtifactWorkflow(unittest.TestCase):
+    """The legal artifact gate must run before a release can publish its assets."""
+
+    def test_legal_artifact_verifier_runs_before_publication(self):
+        workflow = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        steps = list(
+            re.finditer(
+                r"^      - name: (?P<name>[^\n]+)\n(?P<body>.*?)(?=^      - name:|\Z)",
+                workflow,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+        )
+        positions = {step["name"]: step.start() for step in steps}
+
+        verifier = next(step for step in steps if step["name"] == "Verify legal payload in release artifacts")
+        self.assertLess(positions["Build wheel + sdist"], verifier.start())
+        self.assertLess(verifier.start(), workflow.index("gh release create"))
+        self.assertIn(
+            "uv run --frozen --no-sync python -I -S scripts/verify_artifacts.py",
+            verifier["body"],
+        )
+        self.assertIn(
+            '"dist/atvr4samsung-${VERSION}-py3-none-any.whl"',
+            verifier["body"],
+        )
+        self.assertIn('"dist/atvr4samsung-${VERSION}.tar.gz"', verifier["body"])
 
 
 if __name__ == "__main__":
