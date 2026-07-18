@@ -23,7 +23,7 @@ login or token is required. Select an exact immutable release; the example versi
 moving alias.
 
 ```bash
-VERSION=2.0.0
+VERSION=2.0.1
 BASE="https://github.com/vb3/atvr4samsung/releases/download/v${VERSION}"
 curl --fail --silent --show-error --location \
   --output "atvr4samsung-${VERSION}-deploy.tar.gz" \

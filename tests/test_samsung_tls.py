@@ -10,8 +10,8 @@ import os
 from pathlib import Path
 import shutil
 import ssl
+import tempfile
 import unittest
-import uuid
 from unittest.mock import patch
 
 from atvr4samsung import app
@@ -55,13 +55,13 @@ _CERTIFICATE = certificate_from_pem(_CERTIFICATE_PEM)
 
 
 class _ProjectScratch:
-    """Use a per-test project-relative directory rather than an OS temporary directory."""
+    """Use the platform temporary root so checkout ACLs do not affect state tests."""
 
     def setUp(self) -> None:
-        self.scratch = (
-            Path(__file__).resolve().parents[1] / f".test-samsung-tls-{uuid.uuid4().hex}"
-        )
-        self.scratch.mkdir(mode=0o700)
+        self.scratch = Path(
+            tempfile.mkdtemp(prefix="atvr4samsung-samsung-tls-")
+        ).resolve()
+        self.scratch.chmod(0o700)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.scratch, ignore_errors=True)

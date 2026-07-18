@@ -10,7 +10,6 @@ import struct
 import sys
 import tempfile
 import unittest
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,11 +31,13 @@ from atvr4samsung.companion.protocol.atomic_io import (
 
 
 class _ProjectScratch:
-    """Keep new filesystem tests inside the checkout instead of an OS temporary directory."""
+    """Use the platform temporary root so checkout ACLs do not affect state tests."""
 
     def setUp(self) -> None:
-        self.scratch = Path(__file__).resolve().parents[1] / f".test-atomic-io-{uuid.uuid4().hex}"
-        self.scratch.mkdir(mode=0o700)
+        self.scratch = Path(
+            tempfile.mkdtemp(prefix="atvr4samsung-atomic-io-")
+        ).resolve()
+        self.scratch.chmod(0o700)
 
     def tearDown(self) -> None:
         shutil.rmtree(self.scratch, ignore_errors=True)

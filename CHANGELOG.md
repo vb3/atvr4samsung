@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [2.0.1] - 2026-07-18
+
+### Fixed
+
+- Isolated strict state-permission tests from checkout-directory ACLs used by hosted CI runners,
+  without weakening production ancestor ACL validation.
+
 ## [2.0.0] - 2026-07-18
 
 ### Added

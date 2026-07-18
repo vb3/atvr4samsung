@@ -19,7 +19,7 @@ but only Docker Engine plus Compose on Linux is guaranteed.
 Choose an exact stable version, then download the deployment bundle and its offline attestation:
 
 ```bash
-VERSION=2.0.0
+VERSION=2.0.1
 BASE="https://github.com/vb3/atvr4samsung/releases/download/v${VERSION}"
 curl --fail --silent --show-error --location \
   --output "atvr4samsung-${VERSION}-deploy.tar.gz" \
