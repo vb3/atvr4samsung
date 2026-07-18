@@ -12,7 +12,7 @@ from atvr4samsung.config import Config
 
 def minimal_mapping(**overrides):
     data = {
-        "companion": {"device_name": "Frame Living Room", "pin": "0000"},
+        "companion": {"device_name": "Frame Living Room"},
         "samsung": {"host": "192.168.1.50", "mac": "aa:bb:cc:dd:ee:ff"},
     }
     data.update(overrides)
@@ -41,25 +41,10 @@ class TestConfigValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             Config.from_mapping({})
 
-    def test_non_numeric_companion_pin_raises(self):
-        data = minimal_mapping(companion={"device_name": "Frame Living Room", "pin": "abcd"})
-        with self.assertRaisesRegex(ValueError, "config: companion.pin must be 4-8 digits"):
+    def test_legacy_companion_pin_is_rejected_with_migration_guidance(self):
+        data = minimal_mapping(companion={"device_name": "Frame Living Room", "pin": "1337"})
+        with self.assertRaisesRegex(ValueError, r"no longer supported.*atvr4samsung pair"):
             Config.from_mapping(data)
-
-    def test_too_short_companion_pin_raises(self):
-        data = minimal_mapping(companion={"device_name": "Frame Living Room", "pin": "12"})
-        with self.assertRaisesRegex(ValueError, "config: companion.pin must be 4-8 digits"):
-            Config.from_mapping(data)
-
-    def test_valid_companion_pin_is_accepted(self):
-        cfg = Config.from_mapping(
-            minimal_mapping(companion={"device_name": "Frame Living Room", "pin": "1337"})
-        )
-        self.assertEqual(cfg.companion.pin, "1337")
-
-    def test_default_companion_pin_is_accepted(self):
-        cfg = Config.from_mapping(minimal_mapping(companion={"device_name": "Frame Living Room"}))
-        self.assertEqual(cfg.companion.pin, "0000")
 
 
 class TestConfigDefaults(unittest.TestCase):

@@ -9,7 +9,14 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from atvr4samsung.companion.discovery import CompanionAdvertiser, _HOST_TTL_SECONDS
+from atvr4samsung.companion.discovery import (
+    CompanionAdvertiser,
+    _HOST_TTL_SECONDS,
+    companion_txt_records,
+)
+
+
+_IDENTITY = "11111111-2222-3333-4444-555555555555"
 
 
 class _FakeZeroconf:
@@ -42,8 +49,37 @@ def _addr(info) -> str:
 def _make(zc, detect_ip, **kwargs) -> CompanionAdvertiser:
     return CompanionAdvertiser(
         asyncio.get_event_loop(), zc, port=49152, device_name="Frame",
-        detect_ip=detect_ip, call=_immediate, poll_interval=999, **kwargs,
+        identity_identifier=_IDENTITY, detect_ip=detect_ip,
+        call=_immediate, poll_interval=999, **kwargs,
     )
+
+
+class TestCompanionTxtRecords(unittest.TestCase):
+    def test_identity_fields_are_stable_for_one_pairing_identity(self):
+        first = companion_txt_records(identity_identifier=_IDENTITY)
+        second = companion_txt_records(identity_identifier=_IDENTITY)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["rpMRtID"], _IDENTITY)
+        for field in ("rpHA", "rpHN", "rpAD", "rpHI"):
+            with self.subTest(field=field):
+                self.assertRegex(first[field], r"^[0-9a-f]{12}$")
+        self.assertRegex(first["rpBA"], r"^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$")
+        first_octet = int(first["rpBA"].split(":", 1)[0], 16)
+        self.assertEqual(first_octet & 0x03, 0x02)
+
+    def test_identity_reset_rotates_only_identity_bearing_fields(self):
+        first = companion_txt_records(identity_identifier=_IDENTITY)
+        reset = companion_txt_records(
+            identity_identifier="AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        )
+
+        for field in ("rpHA", "rpHN", "rpAD", "rpHI", "rpBA", "rpMRtID"):
+            with self.subTest(field=field):
+                self.assertNotEqual(first[field], reset[field])
+        for field in ("rpMac", "rpVr", "rpMd", "rpFl"):
+            with self.subTest(field=field):
+                self.assertEqual(first[field], reset[field])
 
 
 class TestCompanionAdvertiser(unittest.IsolatedAsyncioTestCase):
@@ -129,7 +165,8 @@ class TestCompanionAdvertiser(unittest.IsolatedAsyncioTestCase):
 
         adv = CompanionAdvertiser(
             asyncio.get_event_loop(), zc, port=1, device_name="Frame",
-            detect_ip=lambda: "192.0.2.1", call=_immediate, sleep=_park, poll_interval=0,
+            identity_identifier=_IDENTITY, detect_ip=lambda: "192.0.2.1",
+            call=_immediate, sleep=_park, poll_interval=0,
         )
         await adv.start()
         self.assertEqual(len(zc.registered), 1)
@@ -151,7 +188,8 @@ class TestCompanionAdvertiser(unittest.IsolatedAsyncioTestCase):
 
         adv = CompanionAdvertiser(
             asyncio.get_event_loop(), zc, port=1, device_name="Frame",
-            detect_ip=lambda: state["ip"], call=_immediate, sleep=_sleep, poll_interval=0,
+            identity_identifier=_IDENTITY, detect_ip=lambda: state["ip"],
+            call=_immediate, sleep=_sleep, poll_interval=0,
         )
         await adv.start()                   # registers .1, spawns poller
         state["ip"] = "192.0.2.2"           # IP changes before the poller's first refresh

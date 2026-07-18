@@ -2,9 +2,10 @@
 #
 # Install:
 #   sudo useradd --system --home /opt/atvr4samsung --shell /usr/sbin/nologin atvbridge || true
-#   sudo mkdir -p /opt/atvr4samsung /etc/atvr4samsung /var/lib/atvr4samsung
+#   sudo install -d -m 0755 /opt/atvr4samsung /etc/atvr4samsung
+#   sudo install -d -o atvbridge -g atvbridge -m 0700 /var/lib/atvr4samsung
 #   # put the venv + code under /opt/atvr4samsung, config under /etc/atvr4samsung/config.yaml
-#   sudo chown -R atvbridge:atvbridge /opt/atvr4samsung /var/lib/atvr4samsung
+#   sudo chown -R atvbridge:atvbridge /opt/atvr4samsung
 #   sudo cp systemd/atvr4samsung.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now atvr4samsung
 #
@@ -26,6 +27,7 @@ RestartSec=3
 
 # mDNS + the Companion TCP listener need the LAN; everything else is locked down.
 StateDirectory=atvr4samsung
+StateDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

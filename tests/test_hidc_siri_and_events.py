@@ -23,6 +23,7 @@ from atvr4samsung.companion import server as srv
 def _make_hid_service():
     svc = atv.FakeCompanionService.__new__(atv.FakeCompanionService)
     svc._pressed_buttons = set()
+    svc.session = atv.FakeCompanionSessionState(svc)
     svc.state = types.SimpleNamespace(latest_button=None, volume=50.0)
     captured: dict = {}
     svc.send_response = lambda message, content: captured.__setitem__("response", (message, content))
@@ -58,7 +59,7 @@ def test_mapped_button_still_relays_after_siri_change():
     captured.clear()
     svc.handle__hidc(_hidc(HidCommand.Select.value, 0))   # UP
     assert captured.get("response") is not None
-    assert svc.state.latest_button == "select"
+    assert svc.session.latest_button == "select"
     assert HidCommand.Select not in svc._pressed_buttons
 
 

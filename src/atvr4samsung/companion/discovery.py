@@ -6,12 +6,14 @@ Center remote discovers us. Publishes directly via ``zeroconf`` (``ServiceInfo``
 The TXT property values below are Apple-TV-like values. iOS's remote picker keys off ``rpMd`` (model)
 and ``rpFl`` (feature flags) among others — e.g. ``rpMd=AppleTV14,1`` + ``rpVr=715.2`` enable the
 Control Center Power button, and ``rpFl`` bit 8 advertises MediaControl (volume). See docs/lld.md §5.
-The stable per-install *pairing* identity is generated separately (``protocol/server_identity.py``);
-these mDNS TXT constants could likewise be made per-install in future.
+The identity-bearing records derive from the persistent Companion pairing identifier: they remain
+stable across normal restarts and rotate with ``unpair --reset-identity`` so iOS offers Pair-Setup
+instead of retrying obsolete Pair-Verify credentials.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from functools import partial
 from ipaddress import IPv4Address
@@ -39,18 +41,33 @@ _NO_IP = "0.0.0.0"
 _HOST_TTL_SECONDS = 4500
 
 
-def companion_txt_records(*, model: str = "AppleTV14,1", **overrides: str) -> Dict[str, str]:
+def _identity_bytes(identifier: str, field: str) -> bytes:
+    if not identifier:
+        raise ValueError("Companion identity identifier must not be empty")
+    material = f"atvr4samsung-companion-txt-v1\0{field}\0{identifier}".encode()
+    return hashlib.sha256(material).digest()[:6]
+
+
+def companion_txt_records(
+    *,
+    identity_identifier: str,
+    model: str = "AppleTV14,1",
+    **overrides: str,
+) -> Dict[str, str]:
     """Build the Companion TXT record set. Override any field via kwargs."""
+    bluetooth_address = bytearray(_identity_bytes(identity_identifier, "rpBA"))
+    bluetooth_address[0] = (bluetooth_address[0] | 0x02) & 0xFE
     props: Dict[str, str] = {
         "rpMac": "1",
-        "rpHA": "9948cfb6da55",
-        "rpHN": "88f979f04023",
+        "rpHA": _identity_bytes(identity_identifier, "rpHA").hex(),
+        "rpHN": _identity_bytes(identity_identifier, "rpHN").hex(),
         "rpVr": "715.2",
         "rpMd": model,  # which Apple TV model we imitate (AppleTV14,1 = Apple TV 4K (3rd gen); enables CC Power button)
         "rpFl": "0x36782",  # bit 8 = MediaControl → gates CC Volume/Mute (see docs/lld.md §5)
-        "rpAD": "657c1b9d3484",
-        "rpHI": "91756a18d8e5",
-        "rpBA": "9D:19:F9:74:65:EA",
+        "rpAD": _identity_bytes(identity_identifier, "rpAD").hex(),
+        "rpHI": _identity_bytes(identity_identifier, "rpHI").hex(),
+        "rpBA": ":".join(f"{octet:02X}" for octet in bluetooth_address),
+        "rpMRtID": identity_identifier,
     }
     props.update(overrides)
     return props
@@ -63,6 +80,7 @@ async def advertise_companion(
     port: int,
     *,
     device_name: str,
+    identity_identifier: str,
     model: str = "AppleTV14,1",
     properties: Optional[Dict[str, str]] = None,
 ) -> Unpublisher:
@@ -71,7 +89,10 @@ async def advertise_companion(
     ``zconf`` is a ``zeroconf.Zeroconf`` instance; ``address`` is the local IP to advertise; ``port``
     is the Companion TCP port the server is listening on.
     """
-    props = properties or companion_txt_records(model=model)
+    props = properties or companion_txt_records(
+        identity_identifier=identity_identifier,
+        model=model,
+    )
     _LOGGER.info(
         "Advertising _companion-link._tcp as %r (model=%s) at %s:%s",
         device_name,
@@ -123,6 +144,7 @@ class CompanionAdvertiser:
         *,
         port: int,
         device_name: str,
+        identity_identifier: str,
         detect_ip: Callable[[], str],
         model: str = "AppleTV14,1",
         properties: Optional[Dict[str, str]] = None,
@@ -134,8 +156,12 @@ class CompanionAdvertiser:
         self._zconf = zconf
         self._port = port
         self._device_name = device_name
+        self._identity_identifier = identity_identifier
         self._model = model
-        self._properties = properties or companion_txt_records(model=model)
+        self._properties = properties or companion_txt_records(
+            identity_identifier=identity_identifier,
+            model=model,
+        )
         self._poll_interval = poll_interval
         self._detect_ip = detect_ip
         self._sleep = sleep

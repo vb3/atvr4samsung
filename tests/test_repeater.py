@@ -47,8 +47,12 @@ async def _settle() -> None:
 
 def _repeater(send, controller, **config):
     cfg = HoldRepeatConfig(**config) if config else HoldRepeatConfig()
+
+    async def send_with_generation(key, generation):
+        await send(key)
+
     return HoldRepeater(
-        send,
+        send_with_generation,
         config=cfg,
         loop=asyncio.get_event_loop(),
         sleep=controller.sleep,
@@ -205,8 +209,12 @@ class TestShouldContinue(unittest.IsolatedAsyncioTestCase):
 
     def _repeater(self, send, ctl, should_continue, **config):
         cfg = HoldRepeatConfig(**config) if config else HoldRepeatConfig()
+
+        async def send_with_generation(key, generation):
+            await send(key)
+
         return HoldRepeater(
-            send, config=cfg, loop=asyncio.get_event_loop(),
+            send_with_generation, config=cfg, loop=asyncio.get_event_loop(),
             sleep=ctl.sleep, clock=ctl.clock, should_continue=should_continue,
         )
 

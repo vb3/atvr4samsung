@@ -6,16 +6,25 @@ same crypto/TLV primitives the protocol uses (no iPhone, no network).
 """
 import binascii
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from atvr4samsung.companion.protocol import chacha20
 from atvr4samsung.companion.protocol.auth import CompanionServerAuth, verify_controller_signature
-from atvr4samsung.companion.protocol.paired_clients import PairedClients
+from atvr4samsung.companion.protocol.paired_clients import MAX_PAIRED_CLIENTS, PairedClients
 from atvr4samsung.companion.protocol.support import hkdf_expand
 from atvr4samsung.companion.protocol.tlv8 import ErrorCode, TlvValue, read_tlv, write_tlv
+from atvr4samsung.pairing_window import PairingWindowStore
+
+
+_WINDOW_SERVER_IDENTIFIER = "test-server"
+_WINDOW_SERVER_GENERATION = "c" * 32
+_OTHER_SERVER_IDENTIFIER = "replacement-server"
+_OTHER_SERVER_GENERATION = "d" * 32
 
 
 class _Auth(CompanionServerAuth):
@@ -64,6 +73,9 @@ class TestPairVerifyEnforcement(unittest.TestCase):
         paired.add(ident.decode(), _ltpk(sk))
         auth = self._auth(paired)
         self.assertTrue(auth._verify_client(self._m3(ident, self._sign(sk, ident))))
+        self.assertEqual(auth._verified_client_identifier, ident.decode())
+        self.assertEqual(auth._verified_client_ltpk, _ltpk(sk))
+        self.assertTrue(auth.verified_client_is_authorized())
 
     def test_empty_store_is_rejected(self):
         # Regression: an empty store used to fail OPEN (return True for anyone).
@@ -92,6 +104,19 @@ class TestPairVerifyEnforcement(unittest.TestCase):
     def test_enforcement_disabled_accepts_without_a_store(self):
         auth = self._auth(PairedClients(None), require_paired=False)
         self.assertTrue(auth._verify_client({}))
+
+    def test_existing_pair_verify_succeeds_without_an_enrollment_window(self):
+        sk = Ed25519PrivateKey.generate()
+        ident = b"CLIENT-A"
+        paired = PairedClients(None)
+        paired.add(ident.decode(), _ltpk(sk))
+        with tempfile.TemporaryDirectory() as d:
+            auth = _Auth("dev", paired_clients=paired, require_paired=True,
+                         pairing_window=PairingWindowStore(Path(d)))
+            auth._pv_session_key = self.session_key
+            auth._pv_client_pub = self.client_pub
+            auth._pv_server_pub = self.server_pub
+            self.assertTrue(auth._verify_client(self._m3(ident, self._sign(sk, ident))))
 
 
 class _RecordingAuth(CompanionServerAuth):
@@ -133,6 +158,8 @@ class TestPairVerifyMessages(unittest.TestCase):
         auth._pv_session_key = self.session_key
         auth._pv_client_pub = self.client_pub
         auth._pv_server_pub = self.server_pub
+        auth.output_key = os.urandom(32)
+        auth.input_key = os.urandom(32)
 
     def test_m1_uses_a_fresh_server_ephemeral_each_session(self):
         auth = _Auth("dev", paired_clients=PairedClients(None), require_paired=True)
@@ -243,7 +270,8 @@ class TestPairSetupM5(unittest.TestCase):
 
     def _auth(self):
         auth = _SetupRecorder("dev", paired_clients=PairedClients(None), require_paired=True)
-        auth.session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        auth._setup_session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        auth._setup_proof_verified = True
         return auth
 
     def _last_pd(self, auth):
@@ -312,6 +340,19 @@ class TestPairSetupM5(unittest.TestCase):
         auth._m5_setup({TlvValue.EncryptedData: b"not-decryptable"})
         self._assert_rejected(auth)
 
+    def test_m5_before_a_verified_m3_is_rejected(self):
+        auth = _SetupRecorder("dev", paired_clients=PairedClients(None), require_paired=True)
+        auth._setup_session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        signature = _controller_sign(sk, self.srp_key, b"CLIENT-A", ltpk)
+
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: b"CLIENT-A", TlvValue.PublicKey: ltpk, TlvValue.Signature: signature,
+        }))
+
+        self._assert_rejected(auth)
+
     def test_valid_m5_then_pair_verify_succeeds(self):
         auth = self._auth()
         sk = Ed25519PrivateKey.generate()
@@ -328,6 +369,182 @@ class TestPairSetupM5(unittest.TestCase):
         tlv = write_tlv({TlvValue.Identifier: ident, TlvValue.Signature: verify_sig})
         enc = chacha20.Chacha20Cipher(session_key, session_key).encrypt(tlv, nonce="PV-Msg03".encode())
         self.assertTrue(auth._verify_client({TlvValue.EncryptedData: enc}))
+
+    def _window_auth(self, state_dir: Path, store_type=PairingWindowStore):
+        store = store_type(state_dir)
+        window = store.open(
+            server_identifier=_WINDOW_SERVER_IDENTIFIER,
+            server_generation=_WINDOW_SERVER_GENERATION,
+        )
+        auth = _SetupRecorder(
+            "device",
+            unique_id=_WINDOW_SERVER_IDENTIFIER,
+            paired_clients=PairedClients(None),
+            require_paired=True,
+            pairing_window=store,
+            server_identity_generation=_WINDOW_SERVER_GENERATION,
+        )
+        auth._setup_session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        auth._setup_pin = window.pin
+        auth._setup_window_expiry = window.expires_at
+        auth._setup_window_generation = window.generation
+        auth._setup_proof_verified = True
+        return auth, store
+
+    def _valid_m5(self, auth, identifier: bytes) -> None:
+        # Each controller has its own M1–M6 handshake; successful M6 clears the previous SRP state.
+        auth._setup_session = _FakeSRP(binascii.hexlify(self.srp_key).decode())
+        window = auth._pairing_window.active()
+        auth._setup_pin = window.pin
+        auth._setup_window_expiry = window.expires_at
+        auth._setup_window_generation = window.generation
+        auth._setup_proof_verified = True
+        sk = Ed25519PrivateKey.generate()
+        ltpk = _ltpk(sk)
+        signature = _controller_sign(sk, self.srp_key, identifier, ltpk)
+        auth._m5_setup(_m5_blob(self.srp_key, {
+            TlvValue.Identifier: identifier,
+            TlvValue.PublicKey: ltpk,
+            TlvValue.Signature: signature,
+        }))
+
+    def test_multiple_devices_can_complete_setup_in_one_open_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            auth, store = self._window_auth(Path(d))
+            self._valid_m5(auth, b"CLIENT-A")
+            self._valid_m5(auth, b"CLIENT-B")
+
+            self.assertEqual(auth._paired.count(), 2)
+            self.assertIsNotNone(store.active(), "a successful pairing must not close the window")
+
+    def test_replaced_window_rejects_a_valid_stale_m5_before_persisting(self):
+        with tempfile.TemporaryDirectory() as d:
+            auth, store = self._window_auth(Path(d))
+            store.open(
+                server_identifier=_WINDOW_SERVER_IDENTIFIER,
+                server_generation=_WINDOW_SERVER_GENERATION,
+            )  # M1/M3 are bound to the original generation.
+            sk = Ed25519PrivateKey.generate()
+            ltpk = _ltpk(sk)
+            identifier = b"CLIENT-STALE"
+            signature = _controller_sign(sk, self.srp_key, identifier, ltpk)
+
+            auth._m5_setup(_m5_blob(self.srp_key, {
+                TlvValue.Identifier: identifier,
+                TlvValue.PublicKey: ltpk,
+                TlvValue.Signature: signature,
+            }))
+
+            response = read_tlv(auth.sent[-1][1]["_pd"])
+            self.assertEqual(response[TlvValue.Error], bytes([ErrorCode.Authentication]))
+            self.assertTrue(auth._paired.empty())
+
+    def test_m5_rechecks_generation_inside_its_persistence_transaction(self):
+        class _ReplaceBeforeCommit(PairingWindowStore):
+            def mutate_if_current(
+                self,
+                generation,
+                mutation,
+                *,
+                server_identifier,
+                server_generation,
+            ):
+                self.open(
+                    server_identifier=server_identifier,
+                    server_generation=server_generation,
+                )  # Happens after M5's early check but before its locked final recheck.
+                return super().mutate_if_current(
+                    generation,
+                    mutation,
+                    server_identifier=server_identifier,
+                    server_generation=server_generation,
+                )
+
+        with tempfile.TemporaryDirectory() as d:
+            auth, _ = self._window_auth(Path(d), store_type=_ReplaceBeforeCommit)
+            sk = Ed25519PrivateKey.generate()
+            ltpk = _ltpk(sk)
+            identifier = b"CLIENT-RECHECK"
+            signature = _controller_sign(sk, self.srp_key, identifier, ltpk)
+
+            auth._m5_setup(_m5_blob(self.srp_key, {
+                TlvValue.Identifier: identifier,
+                TlvValue.PublicKey: ltpk,
+                TlvValue.Signature: signature,
+            }))
+
+            response = read_tlv(auth.sent[-1][1]["_pd"])
+            self.assertEqual(response[TlvValue.Error], bytes([ErrorCode.Authentication]))
+            self.assertTrue(auth._paired.empty())
+
+    def test_m5_rechecks_server_identity_inside_its_persistence_transaction(self):
+        class _ReplaceServerBeforeCommit(PairingWindowStore):
+            def mutate_if_current(
+                self,
+                generation,
+                mutation,
+                *,
+                server_identifier,
+                server_generation,
+            ):
+                self.open(
+                    server_identifier=_OTHER_SERVER_IDENTIFIER,
+                    server_generation=_OTHER_SERVER_GENERATION,
+                )
+                return super().mutate_if_current(
+                    generation,
+                    mutation,
+                    server_identifier=server_identifier,
+                    server_generation=server_generation,
+                )
+
+        with tempfile.TemporaryDirectory() as d:
+            auth, _ = self._window_auth(Path(d), store_type=_ReplaceServerBeforeCommit)
+            sk = Ed25519PrivateKey.generate()
+            ltpk = _ltpk(sk)
+            identifier = b"CLIENT-WRONG-SERVER"
+            signature = _controller_sign(sk, self.srp_key, identifier, ltpk)
+
+            auth._m5_setup(_m5_blob(self.srp_key, {
+                TlvValue.Identifier: identifier,
+                TlvValue.PublicKey: ltpk,
+                TlvValue.Signature: signature,
+            }))
+
+            response = read_tlv(auth.sent[-1][1]["_pd"])
+            self.assertEqual(response[TlvValue.Error], bytes([ErrorCode.Authentication]))
+            self.assertTrue(auth._paired.empty())
+
+    def test_cleared_window_rejects_a_valid_stale_m5_before_persisting(self):
+        with tempfile.TemporaryDirectory() as d:
+            auth, store = self._window_auth(Path(d))
+            PairingWindowStore.clear_state(store.state_dir)
+            sk = Ed25519PrivateKey.generate()
+            ltpk = _ltpk(sk)
+            identifier = b"CLIENT-CLEARED"
+            signature = _controller_sign(sk, self.srp_key, identifier, ltpk)
+
+            auth._m5_setup(_m5_blob(self.srp_key, {
+                TlvValue.Identifier: identifier,
+                TlvValue.PublicKey: ltpk,
+                TlvValue.Signature: signature,
+            }))
+
+            response = read_tlv(auth.sent[-1][1]["_pd"])
+            self.assertEqual(response[TlvValue.Error], bytes([ErrorCode.Authentication]))
+            self.assertTrue(auth._paired.empty())
+
+    def test_ninth_device_gets_hap_max_peers_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            auth, _ = self._window_auth(Path(d))
+            for index in range(MAX_PAIRED_CLIENTS):
+                auth._paired.add(f"CLIENT-{index}", _ltpk(Ed25519PrivateKey.generate()))
+
+            self._valid_m5(auth, b"CLIENT-NINE")
+
+            response = read_tlv(auth.sent[-1][1]["_pd"])
+            self.assertEqual(response[TlvValue.Error], bytes([ErrorCode.MaxPeers]))
+            self.assertEqual(auth._paired.count(), MAX_PAIRED_CLIENTS)
 
 
 if __name__ == "__main__":

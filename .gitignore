@@ -13,11 +13,13 @@ config.local.yaml
 *-token.txt
 token_file
 samsung-token*
+samsung-tls-cert.pem
 secrets/
 state/
 *.ltpk
 *.key
 pairing/
+pairing-window.json
 
 # ---- python ----
 __pycache__/
@@ -30,6 +32,14 @@ dist/
 venv/
 env/
 .pytest_cache/
+.release-validation/
+tests/.secure-release-install/
+tests/.secure-release-install-*/
+tests/.secure-pipx-lock-integration/
+tests/.secure-pipx-lock-integration-*/
+tests/.secure-canonical-docs/
+tests/.secure-build-script/
+.test-samsung-tls-*/
 .mypy_cache/
 .ruff_cache/
 .coverage

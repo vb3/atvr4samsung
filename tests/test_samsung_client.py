@@ -5,6 +5,7 @@ from types import ModuleType
 import unittest
 from unittest.mock import patch
 
+from atvr4samsung.authorization import AuthorizationRevoked
 from atvr4samsung.samsung.client import (
     SamsungFrameClient,
     _is_expected_socket_drop,
@@ -69,6 +70,54 @@ class FailingStartRemote:
 
     async def close(self):
         self.closed = True
+
+
+class GatedStartRemote(FakeRemote):
+    """A remote whose listener is not ready until the test explicitly releases it."""
+
+    def __init__(self):
+        super().__init__()
+        self.starting = asyncio.Event()
+        self.ready = asyncio.Event()
+
+    async def start_listening(self, callback=None):
+        self.started += 1
+        self.starting.set()
+        await self.ready.wait()
+
+
+class MixedTrafficRemote(FakeRemote):
+    """Detect any interleaving across a key, text broadcast, and text update."""
+
+    def __init__(self):
+        super().__init__()
+        self.timeline = []
+        self._sending = False
+
+    async def send_command(self, command, key_press_delay=None):
+        label = getattr(command, "key", type(command).__name__)
+        if self._sending:
+            raise AssertionError("two Samsung websocket sends overlapped")
+        self._sending = True
+        self.timeline.append(("start", label))
+        await asyncio.sleep(0)
+        self.timeline.append(("end", label))
+        self._sending = False
+
+
+class GateFailRemote(FakeRemote):
+    """Blocks a failed send so another caller can queue behind the lifecycle lock."""
+
+    def __init__(self):
+        super().__init__()
+        self.failing = asyncio.Event()
+        self.release_failure = asyncio.Event()
+
+    async def send_command(self, command, key_press_delay=None):
+        self.sent_commands.append(command)
+        self.failing.set()
+        await self.release_failure.wait()
+        raise ConnectionError("socket dropped")
 
 
 class FakeRemoteFactory:
@@ -137,6 +186,36 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log[2][0], "start")
         self.assertEqual(log[3], ("end", log[2][1]))
 
+    async def test_send_waits_for_start_listening_before_using_remote(self):
+        remote = GatedStartRemote()
+        client = make_client(FakeRemoteFactory(remote))
+
+        connect_task = asyncio.create_task(client.connect())
+        await asyncio.wait_for(remote.starting.wait(), 1)
+        send_task = asyncio.create_task(client.send_key("KEY_HOME"))
+        await asyncio.sleep(0)
+        self.assertEqual(remote.sent_commands, [], "no send may observe a half-started listener")
+
+        remote.ready.set()
+        await asyncio.wait_for(asyncio.gather(connect_task, send_task), 1)
+        self.assertEqual([command.key for command in remote.sent_commands], ["KEY_HOME"])
+
+    async def test_key_and_text_share_one_serialized_lifecycle(self):
+        remote = MixedTrafficRemote()
+        client = make_client(FakeRemoteFactory(remote))
+        await client.connect()
+
+        key_task = asyncio.create_task(client.send_key("KEY_HOME"))
+        await asyncio.sleep(0)  # make the requested key precede the requested text deterministically
+        text_task = asyncio.create_task(client.send_text("hello"))
+        await asyncio.wait_for(asyncio.gather(key_task, text_task), 1)
+
+        self.assertEqual(
+            [kind for kind, _ in remote.timeline],
+            ["start", "end", "start", "end", "start", "end"],
+        )
+        self.assertEqual(remote.timeline[0][1], "KEY_HOME")
+
     async def test_send_key_reconnects_once_and_succeeds(self):
         first_remote = FakeRemote(send_failures=1)
         second_remote = FakeRemote()
@@ -149,6 +228,24 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first_remote.closed)
         self.assertEqual([command.key for command in first_remote.sent_commands], ["KEY_ENTER"])
         self.assertEqual([command.key for command in second_remote.sent_commands], ["KEY_ENTER"])
+
+    async def test_concurrent_sends_share_one_reconnect(self):
+        first_remote = GateFailRemote()
+        second_remote = FakeRemote()
+        client = make_client(FakeRemoteFactory(first_remote, second_remote))
+
+        first = asyncio.create_task(client.send_key("KEY_HOME"))
+        await asyncio.wait_for(first_remote.failing.wait(), 1)
+        second = asyncio.create_task(client.send_key("KEY_UP"))
+        await asyncio.sleep(0)
+        first_remote.release_failure.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 1)
+
+        self.assertTrue(first_remote.closed)
+        self.assertEqual(
+            [command.key for command in second_remote.sent_commands],
+            ["KEY_HOME", "KEY_UP"],
+        )
 
     async def test_send_key_raises_after_second_failure(self):
         first_remote = FakeRemote(send_failures=1)
@@ -217,6 +314,95 @@ class TestSamsungFrameClient(unittest.IsolatedAsyncioTestCase):
     def test_default_key_press_delay_is_responsive(self):
         # Snappier than samsungtvws' 1s default, while still pacing the TV between rapid presses.
         self.assertEqual(SamsungFrameClient(host="192.0.2.10", mac=MAC).key_press_delay, 0.25)
+
+
+class TestSamsungAuthorizationBoundary(unittest.IsolatedAsyncioTestCase):
+    async def _assert_revoked_after_gated_connect(self, operation) -> None:
+        remote = GatedStartRemote()
+        allowed = [True]
+        client = make_client(FakeRemoteFactory(remote))
+
+        task = asyncio.create_task(operation(client, lambda: allowed[0]))
+        await asyncio.wait_for(remote.starting.wait(), 1)
+        allowed[0] = False
+        remote.ready.set()
+
+        with self.assertRaises(AuthorizationRevoked):
+            await task
+        self.assertEqual(remote.sent_commands, [])
+
+    async def test_key_and_power_recheck_after_gated_connect(self):
+        for operation in (
+            lambda client, authorization: client.send_key("KEY_HOME", authorization=authorization),
+            lambda client, authorization: client.power_off(authorization=authorization),
+        ):
+            with self.subTest(operation=operation):
+                await self._assert_revoked_after_gated_connect(operation)
+
+    async def test_text_rechecks_after_gated_connect_before_any_wire_command(self):
+        await self._assert_revoked_after_gated_connect(
+            lambda client, authorization: client.send_text("secret text", authorization=authorization)
+        )
+
+    async def test_text_rechecks_between_broadcast_and_input_string(self):
+        allowed = [True]
+
+        class RevokeAfterBroadcastRemote(FakeRemote):
+            async def send_command(self, command, key_press_delay=None):
+                self.sent_commands.append(command)
+                if len(self.sent_commands) == 1:
+                    allowed[0] = False
+
+        remote = RevokeAfterBroadcastRemote()
+        client = make_client(FakeRemoteFactory(remote))
+
+        with self.assertRaises(AuthorizationRevoked):
+            await client.send_text("secret text", authorization=lambda: allowed[0])
+
+        self.assertEqual(len(remote.sent_commands), 1)
+        self.assertFalse(client._first_text_sent)
+
+    async def test_retry_rechecks_after_reconnect_wait(self):
+        first = FakeRemote(send_failures=1)
+        second = GatedStartRemote()
+        allowed = [True]
+        client = make_client(FakeRemoteFactory(first, second))
+
+        task = asyncio.create_task(client.send_key("KEY_HOME", authorization=lambda: allowed[0]))
+        await asyncio.wait_for(second.starting.wait(), 1)
+        allowed[0] = False
+        second.ready.set()
+
+        with self.assertRaises(AuthorizationRevoked):
+            await task
+        self.assertEqual(len(first.sent_commands), 1)
+        self.assertEqual(second.sent_commands, [])
+
+    async def test_hold_commands_recheck_before_send_commands(self):
+        class HoldRemote(GatedStartRemote):
+            async def send_commands(self, commands):
+                self.sent_commands.extend(commands)
+
+        remote = HoldRemote()
+        allowed = [True]
+        client = make_client(FakeRemoteFactory(remote))
+
+        task = asyncio.create_task(client.hold_key("KEY_RIGHT", authorization=lambda: allowed[0]))
+        await asyncio.wait_for(remote.starting.wait(), 1)
+        allowed[0] = False
+        remote.ready.set()
+
+        with self.assertRaises(AuthorizationRevoked):
+            await task
+        self.assertEqual(remote.sent_commands, [])
+
+    def test_wake_rechecks_authorization_before_sending_packet(self):
+        calls = []
+        client = make_client(FakeRemoteFactory(), wol_sender=calls.append)
+
+        with self.assertRaises(AuthorizationRevoked):
+            client.wake(authorization=lambda: False)
+        self.assertEqual(calls, [])
 
 
 class TestSamsungConnectFailures(unittest.IsolatedAsyncioTestCase):

@@ -102,13 +102,17 @@ class _TicHarness:
     """Drive BridgeCompanionService.handle__tic in isolation, capturing dispatched text."""
 
     def __init__(self):
-        from atvr4samsung.companion.protocol.appletv import FakeCompanionState
+        from atvr4samsung.companion.protocol.appletv import (
+            FakeCompanionSessionState,
+            FakeCompanionState,
+        )
         from atvr4samsung.companion.server import BridgeCompanionService
 
         self.sent = []
         svc = BridgeCompanionService.__new__(BridgeCompanionService)
         svc.state = FakeCompanionState()
-        svc.state.rti_text = ""
+        svc.session = FakeCompanionSessionState(svc)
+        svc.session.rti_text = ""
         svc._dispatch_sink = lambda command: self.sent.append(command.text)
         self.svc = svc
 
@@ -117,7 +121,7 @@ class _TicHarness:
 
     def new_field(self):
         """Simulate a fresh TV field (imeStart resets the buffer)."""
-        self.svc.state.rti_text = ""
+        self.svc.session.rti_text = ""
 
 
 class TestRtiTextOps(unittest.TestCase):

@@ -1,7 +1,7 @@
 """Configuration loading for atvr4samsung.
 
 Loads ``config.yaml`` (see ``config.example.yaml``) into typed dataclasses. No secrets are hardcoded;
-the real ``config.yaml`` (with the PIN) and the Samsung token file are gitignored.
+the real ``config.yaml`` and the Samsung token file are gitignored.
 """
 from __future__ import annotations
 
@@ -9,27 +9,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
-
-
-_COMMON_WEAK_PINS = {"0000", "1111", "1234", "1337", "2222", "4321"}
-
-
-def pin_is_weak(pin: str) -> bool:
-    """Return True for guessable pairing PINs so users can be nudged to safer values."""
-    if not pin or len(pin) < 4:
-        return True
-    if pin in _COMMON_WEAK_PINS:
-        return True
-    if pin.isdigit() and len(set(pin)) == 1:
-        return True
-    if pin.isdigit():
-        pairs = zip(pin, pin[1:])
-        if all(int(curr) + 1 == int(next_) for curr, next_ in pairs):
-            return True
-        pairs = zip(pin, pin[1:])
-        if all(int(curr) - 1 == int(next_) for curr, next_ in pairs):
-            return True
-    return False
 
 
 def _expand(value: Optional[str]) -> Optional[Path]:
@@ -63,13 +42,6 @@ def _as_port(value: Any, default: int, field: str) -> int:
     return port
 
 
-def _as_companion_pin(value: Any) -> str:
-    pin = str(value)
-    if not pin.isdigit() or not 4 <= len(pin) <= 8:
-        raise ValueError("config: companion.pin must be 4-8 digits")
-    return pin
-
-
 @dataclass
 class WolConfig:
     enabled: bool = True
@@ -91,7 +63,6 @@ class SamsungConfig:
 @dataclass
 class CompanionConfig:
     device_name: str = "Frame Living Room"
-    pin: str = "0000"
     port: int = 49152
     model: str = "AppleTV14,1"
     state_dir: Optional[Path] = None
@@ -102,6 +73,15 @@ class Config:
     companion: CompanionConfig
     samsung: SamsungConfig
     log_level: str = "INFO"
+
+    @property
+    def samsung_tls_certificate_file(self) -> Optional[Path]:
+        """Return the fixed operator-approved certificate-pin path, if persistent state is configured."""
+        if self.companion.state_dir is None:
+            return None
+        from .samsung.trust import trust_file_for_state_dir
+
+        return trust_file_for_state_dir(self.companion.state_dir)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "Config":
@@ -114,10 +94,17 @@ class Config:
             raise ValueError("config: samsung.mac is required (needed for Wake-on-LAN)")
 
         wol = dict(sams.get("wol") or {})
+        samsung_port = _as_port(sams.get("port"), 8002, "samsung.port")
+        if samsung_port != 8002:
+            raise ValueError(
+                "config: samsung.port must be 8002; plaintext port 8001 and non-TLS ports "
+                "are not supported"
+            )
+
         samsung = SamsungConfig(
             host=str(sams["host"]),
             mac=str(sams["mac"]),
-            port=_as_port(sams.get("port"), 8002, "samsung.port"),
+            port=samsung_port,
             name=str(sams.get("name", "atvr4samsung")),
             token_file=_expand(sams.get("token_file")),
             wol=WolConfig(
@@ -130,9 +117,13 @@ class Config:
         companion_port = int(comp.get("port", 49152))
         if not 0 <= companion_port <= 65535:
             raise ValueError("config: companion.port must be 0-65535")
+        if "pin" in comp:
+            raise ValueError(
+                "config: companion.pin is no longer supported; remove it and run "
+                "`atvr4samsung pair` whenever you want to enroll a new device"
+            )
         companion = CompanionConfig(
             device_name=str(comp.get("device_name", "Frame Living Room")),
-            pin=_as_companion_pin(comp.get("pin", "0000")),
             port=companion_port,
             model=str(comp.get("model", "AppleTV14,1")),
             state_dir=_expand(comp.get("state_dir")),

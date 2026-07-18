@@ -6,9 +6,9 @@ override calls the base handler (to keep the response/ack contract intact) and t
 decoded command to the Samsung bridge. Validated against a real iPhone (iOS 26).
 
 Auth hardening (shipped): the base ``CompanionServerAuth`` is permissive (hardcoded PIN, shared
-identity, no client-signature check). ``BridgeCompanionService`` honors the config PIN, persists a
-unique server identity + the client LTPKs, and verifies the client signature in pair-verify so only
-paired clients connect. See ``docs/lld.md`` §2/§5.
+identity, no client-signature check). ``BridgeCompanionService`` uses a short-lived enrollment window,
+persists a unique server identity + the client LTPKs, and verifies the client signature in pair-verify
+then re-authorizes that connection before each application frame. See ``docs/lld.md`` §2/§5.
 """
 from __future__ import annotations
 
@@ -16,13 +16,16 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
-from .protocol.enums import FrameType, KeyboardFocusState, MediaControlCommand, MediaControlFlags
-from .protocol.auth import CompanionServerAuth
-from .protocol import opack
+from .protocol.enums import KeyboardFocusState, MediaControlCommand, MediaControlFlags
+from .protocol.guardrails import (
+    AUTHENTICATION_TIMEOUT_SECONDS,
+    ConnectionAdmission,
+    PairFailureLimiter,
+    PairSetupAttemptLimiter,
+)
 
 # Emulated Apple TV server (Companion Link). We subclass it to relay decoded commands.
 from .protocol.appletv import (
-    COMPANION_AUTH_FRAMES,
     DEVICE_NAME,
     FakeCompanionService,
     FakeCompanionState,
@@ -30,6 +33,7 @@ from .protocol.appletv import (
 
 from ..bridge.gestures import TOUCH_ACTION_NAMES, GestureConfig
 from ..bridge.keymap import Action
+from .dispatch import CommandDispatchLane
 from .relay import (
     Command,
     CommandRelay,
@@ -38,6 +42,7 @@ from .relay import (
     volume_key_for,
 )
 from .repeater import HoldRepeater, HoldRepeatConfig
+from ..authorization import AuthorizationCheck
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +92,10 @@ class BridgeCompanionService(FakeCompanionService):
     _t_connect: Optional[float] = None
     _conn_id: str = "----"
     _first_command_logged: bool = False
+    _dispatch_lane: Optional[CommandDispatchLane] = None
+    _dispatch_owner: Optional[object] = None
+    _teardown_task: Optional[asyncio.Task[None]] = None
+    _closing: bool = False
 
     def __init__(
         self,
@@ -96,27 +105,48 @@ class BridgeCompanionService(FakeCompanionService):
         device_name: str = DEVICE_NAME,
         gesture_config: Optional[GestureConfig] = None,
         hold_config: Optional[DirectionalHoldConfig] = None,
-        pin: int = 1111,
         unique_id: Optional[str] = None,
         private_key: Optional[bytes] = None,
+        server_identity_generation: Optional[str] = None,
         paired_clients=None,
         require_paired: bool = False,
+        admission: Optional[ConnectionAdmission] = None,
+        pair_setup_attempt_limiter: Optional[PairSetupAttemptLimiter] = None,
+        pair_failure_limiter: Optional[PairFailureLimiter] = None,
+        server_session_factory: Optional[Callable[[str], tuple[object, str]]] = None,
+        authentication_timeout: float = AUTHENTICATION_TIMEOUT_SECONDS,
+        dispatch_lane: Optional[CommandDispatchLane] = None,
+        service_registry: Optional[set["BridgeCompanionService"]] = None,
+        pairing_window=None,
     ) -> None:
-        # Mirror the base FakeCompanionService.__init__ body. Pass a config PIN + persisted identity
-        # so pairing honors the configured PIN and survives restarts.
-        if unique_id and private_key:
-            CompanionServerAuth.__init__(self, device_name, unique_id=unique_id, pin=pin,
-                                         private_key=private_key, paired_clients=paired_clients,
-                                         require_paired=require_paired)
-        else:
-            CompanionServerAuth.__init__(self, device_name, pin=pin)
-        self.loop = asyncio.get_event_loop()
-        self.state = state
-        self.buffer = b""
-        self.chacha = None
-        self.transport = None
-        self._pressed_buttons = set()
-        self._dispatch = dispatch
+        super().__init__(
+            state,
+            device_name=device_name,
+            unique_id=unique_id,
+            private_key=private_key,
+            server_identity_generation=server_identity_generation,
+            paired_clients=paired_clients,
+            require_paired=require_paired,
+            pairing_window=pairing_window,
+            admission=admission,
+            pair_setup_attempt_limiter=pair_setup_attempt_limiter,
+            pair_failure_limiter=pair_failure_limiter,
+            server_session_factory=server_session_factory,
+            authentication_timeout=authentication_timeout,
+        )
+        if dispatch is not None and dispatch_lane is None:
+            raise ValueError(
+                "BridgeCompanionService requires a bounded dispatch lane; construct it with serve()"
+            )
+        self._dispatch_lane = dispatch_lane
+        self._dispatch_owner = None
+        self._teardown_task = None
+        self._repeater_tasks_to_drain: set[asyncio.Task] = set()
+        self._repeat_owners: dict[int, object] = {}
+        self._closing = False
+        self._service_registry = service_registry
+        if service_registry is not None:
+            service_registry.add(self)
         self._hold_config = hold_config or DirectionalHoldConfig()
         self._relay = CommandRelay(
             self._dispatch_sink, gesture_config=gesture_config, hold_config=self._hold_config
@@ -134,84 +164,171 @@ class BridgeCompanionService(FakeCompanionService):
                 interval=self._hold_config.interval,
                 max_hold=self._hold_config.max_hold,
             ),
+            on_stop=self._cancel_repeat_generation,
         )
 
     async def _stop_all_repeaters(self) -> None:
-        """Cancel any in-flight hold repeat on teardown/disconnect."""
-        await self._repeater.stop_all()
+        """Drain repeat tasks whose generations were synchronously invalidated."""
+        while True:
+            pending = getattr(self, "_repeater_tasks_to_drain", None)
+            if not pending:
+                return
+            tasks = tuple(pending)
+            pending.clear()
+            await self._repeater.drain(tasks)
 
-    async def _send_repeat_key(self, key: str) -> None:
-        """Send one auto-repeat click (fast pacing; the repeater controls cadence)."""
-        if self._dispatch is None:
+    def _invalidate_repeaters(self) -> None:
+        """Synchronously stop active holds and purge their tagged delayed lane work."""
+        tasks = self._repeater.stop_all_now()
+        if not tasks:
             return
-        await self._dispatch(Command(Action.SEND_KEY, key, source="repeat", fast=True))
+        pending = getattr(self, "_repeater_tasks_to_drain", None)
+        if pending is None:
+            pending = set()
+            self._repeater_tasks_to_drain = pending
+        pending.update(tasks)
 
-    # -- robustness: never let one bad frame drop a live session --------------
+    def _begin_dispatch_session(self) -> None:
+        """Give this TV Remote session a fresh command owner."""
+        # A repeat task resolves its lane owner only when it reaches its delayed send. Cancel and
+        # purge it while the old owner is still installed, before a new session can ever become
+        # eligible to receive its work.
+        self._invalidate_repeaters()
+        self._end_dispatch_session()
+        self._schedule_repeater_drain()
+        lane = getattr(self, "_dispatch_lane", None)
+        if lane is None:
+            return
+        owner = object()
+        self._dispatch_owner = owner
+        lane.activate(
+            owner,
+            authorize=self.verified_client_is_authorized,
+            on_unauthorized=self._close_revoked_connection,
+        )
 
-    def data_received(self, data):
-        """Vendored frame loop, hardened so an undecodable frame can't kill the session.
+    def _end_dispatch_session(self) -> None:
+        """Synchronously invalidate queued Samsung work for the current TV Remote session."""
+        owner = getattr(self, "_dispatch_owner", None)
+        lane = getattr(self, "_dispatch_lane", None)
+        self._dispatch_owner = None
+        if lane is not None and owner is not None:
+            lane.cancel_owner(owner)
 
-        the base OPACK decoder (``protocol.opack``) raises on some iOS 26
-        ``_systemInfo`` frames — they carry binary ``deviceCapabilitiesV2`` bplists that
-        trip its UTF-8 string assumption (``UnicodeDecodeError``). The base
-        ``data_received`` calls ``opack.unpack`` *outside* its try/except, so that
-        exception propagates to asyncio and tears down the connection. We mirror the
-        base loop but skip an undecodable frame and keep going. Observed against a real iPhone
-        (iOS 26).
-        """
-        self.buffer += data
+    def _submit_dispatch(self, command: Command) -> bool:
+        """Submit a command to the shared bounded lane."""
+        lane = getattr(self, "_dispatch_lane", None)
+        if lane is None:
+            _LOGGER.warning(
+                "Dropping Samsung command without a bounded dispatch lane (%s)",
+                command.source or command.action.value,
+            )
+            return False
+        owner = getattr(self, "_dispatch_owner", None)
+        if owner is None:
+            _LOGGER.warning(
+                "Dropping Samsung command outside an active TV Remote session (%s)",
+                command.source or command.action.value,
+            )
+            return False
+        return lane.submit(owner, command)
 
-        while self.buffer:
-            payload_length = 4 + int.from_bytes(self.buffer[1:4], byteorder="big")
-            if len(self.buffer) < payload_length:
-                _LOGGER.debug("Expect %d bytes, have %d bytes", payload_length, len(self.buffer))
-                break
+    def _submit_dispatch_and_wait(
+        self,
+        command: Command,
+        *,
+        hold_generation: int,
+        owner: Optional[object] = None,
+    ) -> Optional[asyncio.Future[None]]:
+        """Queue delayed hold work and expose its eventual Samsung-dispatch outcome."""
+        lane = getattr(self, "_dispatch_lane", None)
+        if owner is None:
+            owner = getattr(self, "_dispatch_owner", None)
+        if lane is None or owner is None:
+            _LOGGER.warning(
+                "Dropping delayed hold repeat outside an active bounded dispatch session (%s)",
+                command.source or command.action.value,
+            )
+            return None
+        return lane.submit_and_wait(owner, command, hold_generation=hold_generation)
 
-            frame_type = FrameType(self.buffer[0])
-            header = self.buffer[0:4]
-            frame_data = self.buffer[4:payload_length]
-            self.buffer = self.buffer[payload_length:]
+    def _cancel_repeat_generation(self, hold_generation: int) -> None:
+        """Discard unsent delayed work for a released or superseded hold."""
+        lane = getattr(self, "_dispatch_lane", None)
+        owners = getattr(self, "_repeat_owners", None)
+        owner = (
+            owners.pop(hold_generation, None)
+            if owners is not None
+            else getattr(self, "_dispatch_owner", None)
+        )
+        if lane is not None and owner is not None:
+            lane.cancel_generation(owner, hold_generation)
 
-            if self.chacha and frame_type not in COMPANION_AUTH_FRAMES:
-                try:
-                    frame_data = self.chacha.decrypt(frame_data, aad=header)
-                except Exception:
-                    # ChaCha20-Poly1305 uses a per-direction nonce counter, so a single decrypt
-                    # failure means this session is permanently desynced — typically the phone
-                    # reused a long-idle connection whose NAT/firewall state was dropped across the
-                    # VLAN boundary. Dropping the frame but keeping the socket open strands the
-                    # phone: it still sees an ESTABLISHED TCP connection and keeps sending
-                    # undecryptable frames forever (the "fails to reconnect after idle" symptom).
-                    # Close the connection so iOS reconnects and re-runs pair-verify with fresh
-                    # keys — automating what a manual remote close/reopen does.
-                    _LOGGER.warning(
-                        "Decrypt failed (stale pairing?); closing connection so the client re-pairs"
-                    )
-                    self.buffer = b""
-                    if self.transport is not None:
-                        self.transport.close()
-                    return
+    def _schedule_repeater_drain(self) -> asyncio.Task[None]:
+        """Ensure one task drains repeat tasks already invalidated by this connection."""
+        task = getattr(self, "_teardown_task", None)
+        if task is None or task.done():
+            task = self.loop.create_task(self._stop_all_repeaters())
+            self._teardown_task = task
+        return task
 
-            try:
-                unpacked, _ = opack.unpack(frame_data)
-            except Exception:
-                _LOGGER.exception("Skipping undecodable %s frame (iOS/opack quirk)", frame_type)
-                continue
+    def _schedule_repeater_stop(self) -> asyncio.Task[None]:
+        """Synchronously invalidate holds, then arrange their asynchronous task drain."""
+        self._invalidate_repeaters()
+        return self._schedule_repeater_drain()
 
-            try:
-                if frame_type in COMPANION_AUTH_FRAMES:
-                    self.handle_auth_frame(frame_type, unpacked)
-                else:
-                    if not self.chacha:
-                        raise Exception("client has not authenticated")
-                    _LOGGER.debug("Received OPACK: %s", unpacked)
-                    handler_method_name = f"handle_{unpacked['_i'].lower()}"
-                    if hasattr(self, handler_method_name):
-                        getattr(self, handler_method_name)(unpacked)
-                    else:
-                        self.send_handler_not_supported(unpacked)
-            except Exception:
-                _LOGGER.exception("failed to handle incoming data")
+    async def shutdown(self) -> None:
+        """Invalidate this connection's commands and drain its bounded helper tasks."""
+        self._closing = True
+        self._invalidate_repeaters()
+        self._end_dispatch_session()
+        transport = self.transport
+        if self._teardown_connection() and transport is not None and not transport.is_closing():
+            transport.close()
+        await self._schedule_repeater_drain()
+        registry = getattr(self, "_service_registry", None)
+        if registry is not None:
+            registry.discard(self)
+
+    async def _send_repeat_key(self, key: str, hold_generation: int) -> None:
+        """Send one auto-repeat click (fast pacing; the repeater controls cadence)."""
+        if not self.verified_client_is_authorized():
+            self._close_revoked_connection()
+            raise RuntimeError("paired client authorization was revoked")
+        owners = getattr(self, "_repeat_owners", None)
+        owner = (
+            owners.get(hold_generation)
+            if owners is not None
+            else getattr(self, "_dispatch_owner", None)
+        )
+        if owner is None:
+            raise RuntimeError("Samsung dispatch rejected repeat")
+        completion = self._submit_dispatch_and_wait(
+            Command(Action.SEND_KEY, key, source="repeat", fast=True),
+            hold_generation=hold_generation,
+            owner=owner,
+        )
+        if completion is None:
+            # Let HoldRepeater's existing fail-closed path stop the loop if its command can no longer
+            # belong to a live session or fit in the bounded queue.
+            raise RuntimeError("Samsung dispatch rejected repeat")
+        # Stopping the repeater cancels its task; shield keeps the lane-owned completion alive long
+        # enough for generation cleanup to cancel it without leaking or racing the worker.
+        await asyncio.shield(completion)
+
+    def _close_revoked_connection(self) -> None:
+        """Fail closed when an atomic store update revokes this verified connection."""
+        _LOGGER.warning("Paired-client authorization changed; closing connection")
+        self._close_connection()
+
+    def _close_connection(self) -> None:
+        """Discard this session's Samsung work before asking asyncio to close its transport."""
+        # Transport.close() defers connection_lost() to the event loop. Cancel ownership now so a
+        # revoked or malformed peer cannot send commands already waiting behind a slow Samsung call.
+        if getattr(self, "_repeater", None) is not None:
+            self._schedule_repeater_stop()
+        self._end_dispatch_session()
+        super()._close_connection()
 
     # -- iOS 26 TV Remote Control session keepalive ---------------------------
     #
@@ -249,10 +366,15 @@ class BridgeCompanionService(FakeCompanionService):
         volume/mute keys and sends them to us. iOS 26 then sends volume as HID ``_hidC``
         VolumeUp=8 / VolumeDown=9 / Mute=18 (Mute's button *id* is 29, but the wire code is 18).
         """
+        self._begin_dispatch_session()
         super().handle_tvrcsessionstart(message)
         self.send_event("MediaControlStatus", message["_x"], {_MODERN_FLAGS_KEY: _MEDIA_FLAGS})
         self.send_event("_iMC", message["_x"], {_LEGACY_FLAGS_KEY: _MEDIA_FLAGS})
-        _LOGGER.info("[conn %s] TVRCSessionStart +%.3fs since TCP connect", self._conn_id, self._since_connect())
+        _LOGGER.info(
+            "[conn %s] TVRCSessionStart +%.3fs since TCP connect",
+            self.session.connection_id,
+            self._since_connect(),
+        )
 
     def handle_fetchsiriremoteinfo(self, message):  # noqa: N802
         """Empty info satisfies iOS; volume is gated by MediaControlFlags, not Siri info."""
@@ -270,7 +392,11 @@ class BridgeCompanionService(FakeCompanionService):
 
     def handle_tvrcsessionstop(self, message):  # noqa: N802
         """Acknowledge the client closing its TV Remote session (tidy teardown)."""
-        self.loop.create_task(self._stop_all_repeaters())
+        # A blocked lane can be made runnable by the frame immediately before this one. Invalidate
+        # generations before scheduling the drain task, or that worker can dispatch a queued repeat.
+        self._invalidate_repeaters()
+        self._end_dispatch_session()
+        self._schedule_repeater_drain()
         self.send_response(message, {})
 
     def handle_mediacontrolcommand(self, message):  # noqa: N802
@@ -285,7 +411,7 @@ class BridgeCompanionService(FakeCompanionService):
         GetCaptionSettings reports captions disabled; everything else is acked empty.
         """
         content = message.get("_c", {})
-        _LOGGER.debug("MediaControlCommand frame: %s", content)
+        _LOGGER.debug("MediaControlCommand received")
         try:
             cmd = MediaControlCommand(content.get("MediaControlCommand"))
         except ValueError:
@@ -326,8 +452,8 @@ class BridgeCompanionService(FakeCompanionService):
         if not width or width < 0 or width > 1000 or not height or height < 0 or height > 1000:
             self.send_error(message, "Invalid touchpad width or height")
             return
-        self.state.touch_width = width
-        self.state.touch_height = height
+        self.session.touch_width = width
+        self.session.touch_height = height
         self.send_response(message, {"_i": 1})
 
     def handle__touchstop(self, message):  # noqa: N802
@@ -339,7 +465,7 @@ class BridgeCompanionService(FakeCompanionService):
         held-swipe repeat can't run on to the ``max_hold`` cap; the relay's hold state re-initializes
         on the next press.
         """
-        self.loop.create_task(self._repeater.stop_all())
+        self._schedule_repeater_stop()
         self.send_response(message, {})
 
     def handle__tistart(self, message):  # noqa: N802
@@ -356,13 +482,12 @@ class BridgeCompanionService(FakeCompanionService):
         """
         if message.get("_t") != 2:
             return
-        self.state.rti_session_uuid = b"0123456789abcdef"
-        self.state.rti_text = ""
+        self.session.rti_session_uuid = b"0123456789abcdef"
+        self.session.rti_text = ""
         # Baseline unfocused BEFORE registering, so the later Unfocused->Focused transition fires
         # _tiStarted to us (the focus setter only sends on an actual state change).
-        self.state.rti_focus_state = KeyboardFocusState.Unfocused
-        if self not in self.state.rti_clients:
-            self.state.rti_clients.append(self)
+        self.session.rti_focus_state = KeyboardFocusState.Unfocused
+        self.session.rti_registered = True
         self.send_response(message, {})
 
     def handle__tic(self, message):  # noqa: N802
@@ -385,7 +510,7 @@ class BridgeCompanionService(FakeCompanionService):
                 ["textOperations", "keyboardOutput", "deletionCount"],
             )
         except Exception:
-            _LOGGER.exception("Failed to decode RTI _tiC")
+            self._malformed_frame("malformed RTI message")
             return
 
         # iOS sends per-keystroke ops: an insertion (append), a deletionCount (backspace N chars), or a
@@ -393,7 +518,7 @@ class BridgeCompanionService(FakeCompanionService):
         # don't gate on it — we rebuild the field value from our running buffer and dedupe against the
         # PRE-op value (which resets to "" on each imeStart), so identical text in a new field still
         # forwards while no-op sync frames don't.
-        old = self.state.rti_text or ""
+        old = self.session.rti_text or ""
         text = old
         if text_to_assert is not None:
             text = str(text_to_assert)
@@ -404,7 +529,7 @@ class BridgeCompanionService(FakeCompanionService):
             text += str(insertion_text)
         if len(text) > _RTI_MAX_TEXT:
             text = text[:_RTI_MAX_TEXT]  # bound attacker/runaway growth
-        self.state.rti_text = text
+        self.session.rti_text = text
 
         if text == old:
             return  # no change (e.g. a periodic no-op _tiC) -> nothing to send
@@ -413,28 +538,39 @@ class BridgeCompanionService(FakeCompanionService):
 
     def connection_made(self, transport):
         super().connection_made(transport)
-        self._t_connect = self.loop.time()
-        self._first_command_logged = False
-        self._conn_id = f"{id(transport) & 0xffff:04x}"
+        if not self._admitted:
+            return
+        self.session.connected_at = self.loop.time()
+        self.session.first_command_logged = False
+        self.session.connection_id = f"{id(transport) & 0xffff:04x}"
         peer = transport.get_extra_info("peername")
         # peer is the phone (or the mDNS reflector's forwarded source) — a LAN IP, useful for spotting
         # a cross-VLAN path; no secret. This is the T0 for the per-connection latency trace.
-        _LOGGER.info("[conn %s] TCP connected from %s", self._conn_id, peer[0] if peer else "?")
+        _LOGGER.info(
+            "[conn %s] TCP connected from %s",
+            self.session.connection_id,
+            peer[0] if peer else "?",
+        )
 
     def _since_connect(self) -> float:
         """Seconds since this client's TCP connection was accepted (-1 if unknown)."""
-        return self.loop.time() - self._t_connect if self._t_connect is not None else -1.0
+        if self.session.connected_at is None:
+            return -1.0
+        return self.loop.time() - self.session.connected_at
 
     def connection_lost(self, exc):
-        # Stop any in-flight hold repeat so a mid-hold disconnect can't leave the TV keys running.
-        self.loop.create_task(self._stop_all_repeaters())
-        # Base clears transport + state.clients but not rti_clients; drop our registration so a stale
-        # connection can't keep receiving focus pushes.
-        try:
-            if self in self.state.rti_clients:
-                self.state.rti_clients.remove(self)
-        finally:
-            super().connection_lost(exc)
+        if not self._teardown_connection():
+            return
+        # Invalidate before scheduling cleanup: a worker that is waiting on the Samsung lifecycle lock
+        # must never send after the iPhone connection that owned it has gone.
+        self._invalidate_repeaters()
+        self._end_dispatch_session()
+        if not getattr(self, "_closing", False):
+            task = self._schedule_repeater_drain()
+            registry = getattr(self, "_service_registry", None)
+            if registry is not None:
+                task.add_done_callback(lambda _: registry.discard(self))
+        _LOGGER.debug("Client disconnected")
 
     def handle__interest(self, message):  # noqa: N802
         """Push an initial state event when iOS subscribes to one.
@@ -462,8 +598,8 @@ class BridgeCompanionService(FakeCompanionService):
         try:
             content = message["_c"]
             self._relay.on_button(int(content["_hidC"]), int(content["_hBtS"]))
-        except Exception:  # never let a relay error break the protocol loop
-            _LOGGER.exception("Failed to relay _hidC frame")
+        except Exception:  # never let malformed input break the protocol loop
+            self._malformed_frame("malformed HID button")
 
     def handle__hidt(self, message):  # noqa: N802
         # Base decode only logs + records state (no response to preserve); isolate it so a malformed
@@ -471,7 +607,7 @@ class BridgeCompanionService(FakeCompanionService):
         try:
             super().handle__hidt(message)
         except Exception:
-            _LOGGER.debug("Base _hidT decode failed on a malformed frame", exc_info=True)
+            self._malformed_frame("malformed touch message")
         try:
             content = message.get("_c", {})
             raw_phase = int(content["_tPh"])
@@ -487,28 +623,34 @@ class BridgeCompanionService(FakeCompanionService):
                 return
             self._relay.on_touch(action, cx, cy)
         except Exception:
-            _LOGGER.exception("Failed to relay _hidT frame")
+            self._malformed_frame("malformed HID touch")
 
-    # -- dispatch sink: schedule the async Samsung relay off the protocol loop ----
+    # -- dispatch sink: submit to the bounded Samsung relay lane ----------------
 
     def _dispatch_sink(self, command: Command) -> None:
-        """Receive a resolved command from the relay and schedule its async dispatch.
+        """Receive a resolved command from the relay without blocking the protocol loop.
 
-        The relay is synchronous (it runs inside a protocol handler); fire the dispatch as a task so
-        a slow Samsung call can't block the Companion frame loop.
+        The relay is synchronous, but production commands enter one bounded FIFO worker instead of
+        creating an unbounded task per frame.
         """
         # Hold-repeat control for a held directional swipe. Registered synchronously here, in frame
         # order, so a release (STOP) can never race ahead of its press (START). START also fires one
-        # guaranteed immediate click as an independent task (never cancelled), so a fast swipe always
-        # yields exactly one step while the repeater drives only the delayed repeats.
+        # immediate click that is independent of the repeater (but still owned by this session), so a
+        # fast swipe always yields exactly one step while the repeater drives only delayed repeats.
         if command.repeat is RepeatPhase.START:
             _LOGGER.info("Relay hold START (%s)", command.source)
             key = command.samsung_key
             if key is not None:
-                if self._dispatch is not None:
-                    self.loop.create_task(self._safe_dispatch(
-                        Command(command.action, key, source=command.source, fast=True)))
-                self._repeater.start(key)
+                owner = getattr(self, "_dispatch_owner", None)
+                immediate = Command(command.action, key, source=command.source, fast=True)
+                if self._submit_dispatch(immediate):
+                    generation = self._repeater.start(key)
+                    if isinstance(generation, int) and owner is not None:
+                        owners = getattr(self, "_repeat_owners", None)
+                        if owners is None:
+                            owners = {}
+                            self._repeat_owners = owners
+                        owners.setdefault(generation, owner)
             return
         if command.repeat is RepeatPhase.STOP:
             _LOGGER.info("Relay hold STOP (%s)", command.source)
@@ -522,22 +664,14 @@ class BridgeCompanionService(FakeCompanionService):
             _LOGGER.info("Relay %s (%s)", command.action.value, command.source)
         # First command of a connection: log elapsed-since-connect (T3). Combined with the Samsung
         # client's own "connected in N.NNNs", this shows whether the first press ate a cold reconnect.
-        if not self._first_command_logged:
-            self._first_command_logged = True
+        session = getattr(self, "session", None)
+        if session is not None and not session.first_command_logged:
+            session.first_command_logged = True
             _LOGGER.info(
                 "[conn %s] first command +%.3fs since TCP connect (%s)",
-                self._conn_id, self._since_connect(), command.action.value,
+                session.connection_id, self._since_connect(), command.action.value,
             )
-        if self._dispatch is None:
-            return
-        self.loop.create_task(self._safe_dispatch(command))
-
-    async def _safe_dispatch(self, command: Command) -> None:
-        try:
-            await self._dispatch(command)
-        except Exception:
-            _LOGGER.exception("Dispatch failed for %s", command)
-
+        self._submit_dispatch(command)
 
 def make_ime_focus_handler(state: FakeCompanionState):
     """Build a Samsung-IME-event handler that mirrors the TV's text-field focus to the iPhone.
@@ -548,14 +682,27 @@ def make_ime_focus_handler(state: FakeCompanionState):
     RTI session (``_tiStart``), so we never focus into the void.
     """
     def handle(event: str, response=None) -> None:
+        if not hasattr(state, "active_rti_sessions"):
+            # Compatibility with the lightweight single-session stand-ins used by callers/tests.
+            if event == "ms.remote.imeStart":
+                if state.rti_session_uuid is None or not state.rti_clients:
+                    return
+                if state.rti_focus_state != KeyboardFocusState.Focused:
+                    state.rti_text = ""
+                    state.rti_focus_state = KeyboardFocusState.Focused
+            elif event == "ms.remote.imeEnd":
+                state.rti_focus_state = KeyboardFocusState.Unfocused
+            return
+
+        sessions = state.active_rti_sessions()
         if event == "ms.remote.imeStart":
-            if state.rti_session_uuid is None or not state.rti_clients:
-                return
-            if state.rti_focus_state != KeyboardFocusState.Focused:
-                state.rti_text = ""
-                state.rti_focus_state = KeyboardFocusState.Focused
+            for session in sessions:
+                if session.rti_focus_state != KeyboardFocusState.Focused:
+                    session.rti_text = ""
+                    session.rti_focus_state = KeyboardFocusState.Focused
         elif event == "ms.remote.imeEnd":
-            state.rti_focus_state = KeyboardFocusState.Unfocused
+            for session in sessions:
+                session.rti_focus_state = KeyboardFocusState.Unfocused
 
     return handle
 
@@ -566,21 +713,51 @@ def make_samsung_dispatch(client) -> Dispatch:
     ``client`` is an (already-connected) ``SamsungFrameClient``. Play/pause is a single stateless TV
     key (``KEY_PLAY_BACK``, mapped in ``bridge/keymap.py``), so there's no toggle state to track here.
     """
-    async def dispatch(command: Command) -> None:
+    async def dispatch_command(
+        command: Command,
+        authorization: Optional[AuthorizationCheck] = None,
+    ) -> None:
         if command.action is Action.SEND_KEY and command.samsung_key:
             # Auto-repeat/first-click hold sends set fast=True so the library's post-send pacing
             # doesn't stack up; the repeater's own interval controls cadence.
             key_press_delay = 0.0 if command.fast else None
-            await client.send_key(command.samsung_key, command.cmd, key_press_delay=key_press_delay)
+            if authorization is None:
+                await client.send_key(command.samsung_key, command.cmd, key_press_delay=key_press_delay)
+            else:
+                await client.send_key(
+                    command.samsung_key,
+                    command.cmd,
+                    key_press_delay=key_press_delay,
+                    authorization=authorization,
+                )
         elif command.action is Action.SEND_TEXT and command.text is not None:
-            await client.send_text(command.text)
+            if authorization is None:
+                await client.send_text(command.text)
+            else:
+                await client.send_text(command.text, authorization=authorization)
         elif command.action is Action.POWER_OFF:
-            await client.power_off()
+            if authorization is None:
+                await client.power_off()
+            else:
+                await client.power_off(authorization=authorization)
         elif command.action is Action.WAKE_ON_LAN:
-            client.wake()
+            if authorization is None:
+                client.wake()
+            else:
+                client.wake(authorization=authorization)
         else:
-            _LOGGER.debug("No dispatch for %s", command)
+            _LOGGER.debug("No dispatch for action %s", command.action.value)
 
+    async def dispatch(command: Command) -> None:
+        await dispatch_command(command)
+
+    async def dispatch_authorized(
+        command: Command,
+        authorization: Optional[AuthorizationCheck],
+    ) -> None:
+        await dispatch_command(command, authorization)
+
+    setattr(dispatch, "dispatch_authorized", dispatch_authorized)
     return dispatch
 
 
@@ -593,31 +770,98 @@ async def serve(
     gesture_config: Optional[GestureConfig] = None,
     hold_config: Optional[DirectionalHoldConfig] = None,
     state: Optional[FakeCompanionState] = None,
-    pin: int = 1111,
     unique_id: Optional[str] = None,
     private_key: Optional[bytes] = None,
+    server_identity_generation: Optional[str] = None,
     paired_clients=None,
     require_paired: bool = False,
+    admission: Optional[ConnectionAdmission] = None,
+    pair_setup_attempt_limiter: Optional[PairSetupAttemptLimiter] = None,
+    pair_failure_limiter: Optional[PairFailureLimiter] = None,
+    server_session_factory: Optional[Callable[[str], tuple[object, str]]] = None,
+    authentication_timeout: float = AUTHENTICATION_TIMEOUT_SECONDS,
+    pairing_window=None,
 ):
     """Start the Companion TCP server. Returns ``(server, state)``.
 
     ``port=0`` binds an ephemeral port (read it back from ``server.sockets[0].getsockname()[1]`` to
-    advertise via :func:`atvr4samsung.companion.discovery.advertise_companion`). ``pin`` +
-    ``unique_id``/``private_key`` configure pairing (config PIN + persisted identity);
-    ``paired_clients`` + ``require_paired`` enforce paired-only pair-verify.
+    advertise via :func:`atvr4samsung.companion.discovery.advertise_companion`).
+    ``unique_id``/``private_key``/``server_identity_generation`` configure the persisted Apple-TV
+    identity; ``pairing_window`` gates new pair-setup and ``paired_clients`` + ``require_paired``
+    enforce paired-only pair-verify. Call :func:`close_server` rather than closing the returned
+    asyncio server directly so its bounded Samsung dispatch worker is drained before the Samsung
+    client is closed.
     """
     loop = asyncio.get_event_loop()
     state = state or FakeCompanionState()
+    admission = admission or ConnectionAdmission()
+    pair_setup_attempt_limiter = pair_setup_attempt_limiter or PairSetupAttemptLimiter()
+    pair_failure_limiter = pair_failure_limiter or PairFailureLimiter()
+    lane = CommandDispatchLane(dispatch, loop=loop) if dispatch is not None else None
+    if lane is not None:
+        lane.start()
+    services: set[BridgeCompanionService] = set()
 
     def factory():
         return BridgeCompanionService(
             state, dispatch, device_name=device_name, gesture_config=gesture_config,
             hold_config=hold_config,
-            pin=pin, unique_id=unique_id, private_key=private_key,
-            paired_clients=paired_clients, require_paired=require_paired,
+            unique_id=unique_id, private_key=private_key,
+            server_identity_generation=server_identity_generation, paired_clients=paired_clients,
+            require_paired=require_paired, pairing_window=pairing_window,
+            admission=admission,
+            pair_setup_attempt_limiter=pair_setup_attempt_limiter,
+            pair_failure_limiter=pair_failure_limiter,
+            server_session_factory=server_session_factory,
+            authentication_timeout=authentication_timeout,
+            dispatch_lane=lane, service_registry=services,
         )
 
-    server = await loop.create_server(factory, host, port)
-    bound_port = server.sockets[0].getsockname()[1]
+    server = None
+    try:
+        server = await loop.create_server(factory, host, port)
+        # asyncio.Server has no application-shutdown hook. Keep these private attachments so
+        # close_server can deterministically drain connection helpers and the sole command worker.
+        server._atvr4samsung_dispatch_lane = lane  # type: ignore[attr-defined]
+        server._atvr4samsung_services = services  # type: ignore[attr-defined]
+        server._atvr4samsung_paired_clients = paired_clients  # type: ignore[attr-defined]
+        bound_port = server.sockets[0].getsockname()[1]
+    except BaseException:
+        try:
+            if server is not None:
+                server.close()
+            if services:
+                await asyncio.gather(
+                    *(service.shutdown() for service in services),
+                    return_exceptions=True,
+                )
+            if server is not None:
+                await server.wait_closed()
+        finally:
+            if lane is not None:
+                await lane.close()
+            close_paired = getattr(paired_clients, "close", None)
+            if close_paired is not None:
+                close_paired()
+        raise
     _LOGGER.info("Companion server listening on %s:%s as %r", host, bound_port, device_name)
     return server, state
+
+
+async def close_server(server) -> None:
+    """Stop accepting clients, invalidate their work, and drain the Samsung dispatch lane."""
+    try:
+        server.close()
+        services = tuple(getattr(server, "_atvr4samsung_services", ()))
+        if services:
+            await asyncio.gather(*(service.shutdown() for service in services))
+        await server.wait_closed()
+        lane = getattr(server, "_atvr4samsung_dispatch_lane", None)
+        if lane is not None:
+            await lane.close()
+    finally:
+        close_paired = getattr(server, "_atvr4samsung_paired_clients", None)
+        if close_paired is not None:
+            close = getattr(close_paired, "close", None)
+            if close is not None:
+                close()

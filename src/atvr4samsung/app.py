@@ -10,19 +10,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack
-import getpass
 import logging
 import os
 import pathlib
+import pwd
 import re
-import secrets
 import shutil
 import signal
 import socket
 import sys
-from typing import Optional
+from datetime import datetime
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional, TypeVar
 
-from .config import Config, load_config, pin_is_weak
+from .config import Config, load_config
+from .pairing_window import DEFAULT_WINDOW_SECONDS, PairingWindowStore
+
+if TYPE_CHECKING:
+    from .companion.protocol.paired_clients import PairedClients
+    from .companion.protocol.server_identity import ServerIdentity
 
 try:
     from importlib.metadata import version as _pkg_version
@@ -32,10 +37,12 @@ except Exception:  # not installed as a distribution (bare source tree)
     __version__ = "0.0.0+unknown"
 
 # Default config location (XDG-style). The CLI uses this when --config is omitted so `run`/`init`/
-# `--check`/`install-service` all agree with the installer and docs.
+# `--check`/`install-service`/`trust-tv`/`pair` all agree with the installer and docs.
 DEFAULT_CONFIG_PATH = "~/.config/atvr4samsung/config.yaml"
 
 _LOGGER = logging.getLogger(__name__)
+_ListenerResult = TypeVar("_ListenerResult")
+_SYSTEMD_ACCOUNT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 
 
 def _detect_local_ip(target_host: str) -> str:
@@ -50,7 +57,7 @@ def _detect_local_ip(target_host: str) -> str:
         sock.close()
 
 
-def _print_check(config: Config) -> None:
+def _print_check(config: Config) -> bool:
     print("atvr4samsung — resolved configuration")
     print(f"  Apple side : advertise {config.companion.device_name!r} "
           f"(model {config.companion.model}) on TCP port {config.companion.port}")
@@ -59,35 +66,79 @@ def _print_check(config: Config) -> None:
     print(f"  Wake-on-LAN: enabled={config.samsung.wol.enabled} mac={config.samsung.mac} "
           f"via {config.samsung.wol.broadcast}:{config.samsung.wol.port}")
     print(f"  Local IP   : {_detect_local_ip(config.samsung.host)}")
-    if pin_is_weak(config.companion.pin):
-        print("  PIN        : WEAK — set a stronger companion.pin before a public deployment.")
+    if config.companion.state_dir is None:
+        print("  State dir  : MISSING — required to run or manage controlled enrollment.")
+        print("  Config is incomplete: add companion.state_dir before running the bridge.")
+        return False
+    else:
+        print(f"  State dir  : {config.companion.state_dir}")
+        print(
+            "  Samsung TLS: requires a 0600 certificate pin at "
+            f"{config.samsung_tls_certificate_file} "
+            "(create it with `atvr4samsung trust-tv`)"
+        )
     print("  Config looks valid. (This does not contact the TV or the phone; run `doctor` for that.)")
+    return True
+
+
+async def _start_companion_listener_with_identity(
+    state_dir: pathlib.Path,
+    create_listener: Callable[
+        ["ServerIdentity", "PairedClients", PairingWindowStore],
+        Awaitable[_ListenerResult],
+    ],
+) -> _ListenerResult:
+    """Recover/load identity and bind its listener as one pairing-state transaction.
+
+    The lock ends as soon as ``create_listener`` returns a listening server. This gives a reset one
+    unambiguous outcome: it either recovers before startup chooses an identity, or it resets an
+    already-listening daemon. The paired-client snapshot is constructed while locked as well, so a
+    recovered clear cannot leave the new daemon with a stale initial mapping.
+    """
+    from .companion.protocol.paired_clients import PairedClients
+    from .companion.protocol.pairing_state import async_pairing_state_lock
+    from .companion.protocol.server_identity import load_or_create_server_identity_locked
+
+    async with async_pairing_state_lock(state_dir):
+        identity = load_or_create_server_identity_locked(state_dir)
+        paired = PairedClients(state_dir / "paired-clients.json")
+        pairing_window = PairingWindowStore(state_dir)
+        try:
+            return await create_listener(identity, paired, pairing_window)
+        except BaseException:
+            paired.close()
+            raise
 
 
 async def run(config: Config) -> None:
-    if pin_is_weak(config.companion.pin):
-        _LOGGER.warning(
-            "Configured pairing PIN is weak or a default; set a stronger PIN in config.yaml "
-            "(companion.pin) for a public-facing deployment."
+    if config.companion.state_dir is None:
+        raise RuntimeError(
+            "companion.state_dir is required to run: it holds the persistent identity, paired devices, "
+            "and fail-closed enrollment window"
         )
+    from .samsung.trust import load_trusted_certificate
+
+    tls_certificate_file = config.samsung_tls_certificate_file
+    assert tls_certificate_file is not None
+    # Refuse to advertise a bridge that could only reach the TV through an unpinned transport. This
+    # does not contact the TV; `trust-tv` is the sole administrative path that creates this state.
+    load_trusted_certificate(tls_certificate_file)
 
     # Imported lazily so `--check` and tests don't require the runtime deps (samsungtvws).
     from zeroconf import Zeroconf
 
     from .bridge.gestures import GestureConfig
     from .companion.discovery import CompanionAdvertiser
-    from .companion.protocol.paired_clients import PairedClients
-    from .companion.protocol.server_identity import load_or_create_identity
     from .companion.relay import DirectionalHoldConfig
-    from .companion.server import make_ime_focus_handler, make_samsung_dispatch, serve
-    from .samsung.client import SamsungFrameClient
+    from .companion.server import (
+        close_server as close_companion_server,
+        make_ime_focus_handler,
+        make_samsung_dispatch,
+        serve,
+    )
+    from .samsung.client import SamsungFrameClient, connect_failure_hint
 
     _LOGGER.info("Starting the bridge.")
-
-    server_uuid, private_key = load_or_create_identity(config.companion.state_dir)
-    paired = PairedClients(
-        config.companion.state_dir / "paired-clients.json" if config.companion.state_dir else None
-    )
 
     async with AsyncExitStack() as stack:
         client = SamsungFrameClient(
@@ -96,6 +147,7 @@ async def run(config: Config) -> None:
             port=config.samsung.port,
             name=config.samsung.name,
             token_file=config.samsung.token_file,
+            tls_certificate_file=tls_certificate_file,
             wol_enabled=config.samsung.wol.enabled,
             wol_broadcast=config.samsung.wol.broadcast,
             wol_port=config.samsung.wol.port,
@@ -109,28 +161,43 @@ async def run(config: Config) -> None:
         gesture_config = GestureConfig(repeat_every=350)
         # Swipe-and-hold auto-repeat (directional scroll): dwell ~400ms then repeat.
         hold_config = DirectionalHoldConfig(enabled=True)
-        server, state = await serve(
-            dispatch,
-            host="0.0.0.0",
-            port=config.companion.port,
-            device_name=config.companion.device_name,
-            gesture_config=gesture_config,
-            hold_config=hold_config,
-            pin=int(config.companion.pin),
-            unique_id=server_uuid,
-            private_key=private_key,
-            paired_clients=paired,
-            require_paired=True,
+        bound_identity_identifier: Optional[str] = None
+
+        async def create_listener(server_identity, paired, pairing_window):
+            nonlocal bound_identity_identifier
+            listener = await serve(
+                dispatch,
+                host="0.0.0.0",
+                port=config.companion.port,
+                device_name=config.companion.device_name,
+                gesture_config=gesture_config,
+                hold_config=hold_config,
+                unique_id=server_identity.identifier,
+                private_key=server_identity.private_key,
+                server_identity_generation=server_identity.generation,
+                paired_clients=paired,
+                require_paired=True,
+                pairing_window=pairing_window,
+            )
+            bound_identity_identifier = server_identity.identifier
+            return listener
+
+        server, state = await _start_companion_listener_with_identity(
+            config.companion.state_dir,
+            create_listener,
         )
+        assert bound_identity_identifier is not None
         # Mirror the TV's text-field focus to the iPhone keyboard (system fields only; see operations).
         client.set_ime_event_handler(make_ime_focus_handler(state))
         bound_port = server.sockets[0].getsockname()[1]
 
-        async def close_server() -> None:
-            server.close()
-            await server.wait_closed()
+        server_closed = False
 
-        stack.push_async_callback(close_server)
+        async def close_server() -> None:
+            nonlocal server_closed
+            if not server_closed:
+                server_closed = True
+                await close_companion_server(server)
 
         loop = asyncio.get_event_loop()
 
@@ -150,26 +217,34 @@ async def run(config: Config) -> None:
             advertiser = CompanionAdvertiser(
                 loop, zconf, port=bound_port,
                 device_name=config.companion.device_name,
+                identity_identifier=bound_identity_identifier,
                 model=config.companion.model,
                 detect_ip=lambda: _detect_local_ip(config.samsung.host),
             )
+            stack.push_async_callback(advertiser.close)
             await advertiser.start()
         except OSError as exc:
+            await close_server()
             # Without mDNS the phone can't find us at all, so fail with guidance instead of a raw trace.
             raise RuntimeError(
                 f"mDNS advertisement failed ({exc}). Check that UDP 5353 isn't blocked by a local "
                 "firewall, that the interface allows multicast, and (on segmented VLANs) that an mDNS "
                 "reflector forwards _companion-link._tcp from the phone's network to this host."
             ) from exc
-        stack.push_async_callback(advertiser.close)
+        except BaseException:
+            await close_server()
+            raise
+        # Stop Companion work before tearing down mDNS or the Samsung socket. This keeps a late
+        # remote frame from racing shutdown and lets close_server drain the shared dispatch lane.
+        stack.push_async_callback(close_server)
 
         # The Apple side is now up, so the iPhone can discover + pair even if the TV is offline.
         # Surface what the operator should look for (never the PIN).
         _LOGGER.info(
-            "Advertising %r on Companion port %s — pair from iPhone Control Center → Apple TV "
-            "Remote and enter your PIN. The Samsung 'Allow' prompt appears as %r. State dir: %s",
+            "Advertising %r on Companion port %s — run `atvr4samsung pair` before enrolling a new "
+            "iPhone. The Samsung 'Allow' prompt appears as %r. State dir: %s",
             config.companion.device_name, bound_port, config.samsung.name,
-            config.companion.state_dir or "(ephemeral — set companion.state_dir to persist pairing)",
+            config.companion.state_dir,
         )
 
         # Connect to the TV best-effort: a sleeping/unreachable TV (or a pending 'Allow' prompt) must
@@ -181,7 +256,7 @@ async def run(config: Config) -> None:
             _LOGGER.warning(
                 "Samsung TV at %s:%s not reachable yet (%s); the remote will still pair, and commands "
                 "will connect when the TV is awake. Accept the TV's 'Allow' prompt on first use.",
-                config.samsung.host, config.samsung.port, exc,
+                config.samsung.host, config.samsung.port, connect_failure_hint(exc),
             )
 
         stop = asyncio.Event()
@@ -198,16 +273,9 @@ async def run(config: Config) -> None:
             _LOGGER.info("Shutting down")
 
 
-def _random_pin() -> str:
-    """A non-weak 4-digit pairing PIN so a fresh `init` doesn't ship the example's guessable value."""
-    while True:
-        pin = f"{secrets.randbelow(10000):04d}"
-        if not pin_is_weak(pin):
-            return pin
-
-
 def _cmd_init(path: str) -> int:
     import importlib.resources as ir
+    from .companion.protocol.atomic_io import atomic_write_text
 
     dest = pathlib.Path(path).expanduser()
     if dest.exists():
@@ -216,31 +284,106 @@ def _cmd_init(path: str) -> int:
     try:
         template = ir.files("atvr4samsung").joinpath("config.example.yaml").read_text()
     except (FileNotFoundError, ModuleNotFoundError):
-        template = "companion:\n  device_name: \"Frame Living Room\"\n  pin: \"1337\"\nsamsung:\n  host: \"\"\n  mac: \"\"\n"
+        template = (
+            "companion:\n"
+            "  device_name: \"Frame Living Room\"\n"
+            "  state_dir: \"~/.local/state/atvr4samsung\"\n"
+            "samsung:\n"
+            "  host: \"\"\n"
+            "  mac: \"\"\n"
+        )
 
-    pin = _random_pin()
-    template, replaced = re.subn(r'(?m)^(\s*pin:\s*)".*"', rf'\g<1>"{pin}"', template, count=1)
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(template)
+    atomic_write_text(dest, template, mode=0o600)
     print(f"Wrote {dest}.")
-    if replaced:
-        print(f"Generated a random pairing PIN: {pin} (enter this on the iPhone when pairing).")
-    print("Next: set samsung.host/mac, run `atvr4samsung --check`, then `doctor`.")
+    print(
+        "Next: set samsung.host/mac, run `atvr4samsung --check`, then "
+        "`atvr4samsung trust-tv` before `doctor` or starting the service."
+    )
     return 0
 
 
-def _cmd_install_service(config_path: str, apply: bool = False) -> int:
-    exe = shutil.which("atvr4samsung") or f"{sys.executable} -m atvr4samsung.app"
-    cfg = pathlib.Path(config_path).expanduser().resolve()
-    # Resolve the *real* operator even when invoked via sudo, and refuse to generate a unit that would
-    # run the LAN-facing service as root (a privilege-escalation footgun). SUDO_USER covers
-    # `sudo atvr4samsung ...`; getpass falls back to the passwd db when $USER is unset.
-    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or getpass.getuser()
+def _per_user_service_owner() -> Optional[str]:
+    """Return the current unprivileged account for the bundled per-user unit."""
+    effective_uid = os.geteuid()
+    if effective_uid == 0:
+        print(
+            "error: do not run `atvr4samsung install-service` with sudo or as root. "
+            "Run it as the normal target user; `--apply` requests sudo only for the narrow "
+            "systemd installation steps. For a dedicated system user, adapt "
+            "systemd/atvr4samsung.service instead."
+        )
+        return None
+    try:
+        account = pwd.getpwuid(effective_uid)
+    except KeyError:
+        print(
+            "error: could not resolve the current account through passwd; refusing to generate a "
+            "per-user service."
+        )
+        return None
+    user = account.pw_name
+    if (
+        not isinstance(getattr(account, "pw_uid", None), int)
+        or account.pw_uid != effective_uid
+        or account.pw_uid == 0
+    ):
+        print(
+            "error: passwd did not return the current unprivileged account; refusing to write "
+            "a User= directive."
+        )
+        return None
     if user == "root":
-        print("error: refusing to generate a service that runs as root. Re-run as your normal "
-              "user (the service only needs your home config/state and LAN access), or adapt the "
-              "hardened reference unit in systemd/atvr4samsung.service for a dedicated system user.")
+        print(
+            "error: refusing to generate a per-user service for root. Run as the normal target user, "
+            "or adapt systemd/atvr4samsung.service for a dedicated system user."
+        )
+        return None
+    if not isinstance(user, str) or not _SYSTEMD_ACCOUNT_NAME.fullmatch(user):
+        print(
+            "error: passwd returned an invalid per-user service account name; refusing to write "
+            "a User= directive."
+        )
+        return None
+    return user
+
+
+def _systemd_exec_quote(argument: str) -> str:
+    """Encode one literal argument using systemd.exec's command-line grammar."""
+    if not isinstance(argument, str):
+        raise ValueError("systemd command arguments must be text")
+    if any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in argument):
+        raise ValueError("systemd command arguments must not contain control characters")
+    if argument == ";":
+        return r"\;"
+    return (
+        '"'
+        + argument.replace("\\", "\\\\").replace('"', r'\"').replace("%", "%%").replace("$", "$$")
+        + '"'
+    )
+
+
+def _service_exec_argv(config_path: str) -> list[str]:
+    """Build the direct argv that the generated systemd unit must execute."""
+    executable = shutil.which("atvr4samsung")
+    if executable:
+        argv = [str(pathlib.Path(executable).resolve())]
+    else:
+        argv = [str(pathlib.Path(sys.executable).resolve()), "-m", "atvr4samsung.app"]
+    argv.extend(("--config", str(pathlib.Path(config_path).expanduser().resolve())))
+    return argv
+
+
+def _cmd_install_service(config_path: str, apply: bool = False) -> int:
+    user = _per_user_service_owner()
+    if user is None:
+        return 1
+    if apply and not _service_start_prerequisites_ready(config_path):
+        return 1
+
+    try:
+        exec_start = " ".join(_systemd_exec_quote(argument) for argument in _service_exec_argv(config_path))
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"error: refusing to generate an unsafe systemd ExecStart: {exc}.")
         return 1
     # Hardening compatible with a per-user, home-based config/state install. We deliberately do NOT set
     # ProtectHome / ProtectSystem=strict here because config (~/.config) and pairing state
@@ -254,7 +397,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User={user}
-ExecStart={exe} --config {cfg}
+ExecStart={exec_start}
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
@@ -289,6 +432,35 @@ WantedBy=multi-user.target
     return 0
 
 
+def _service_start_prerequisites_ready(config_path: str) -> bool:
+    """Require a valid config and explicit Samsung certificate pin before privileged service startup."""
+    try:
+        config = load_config(config_path)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"error: cannot install/start the service: {exc}")
+        print("Fix the config, run `atvr4samsung --check`, then approve the TV with `atvr4samsung trust-tv`.")
+        return False
+
+    tls_pin = config.samsung_tls_certificate_file
+    if tls_pin is None:
+        print("error: cannot install/start the service: companion.state_dir is required for the Samsung TLS pin.")
+        print("Set companion.state_dir, then run `atvr4samsung trust-tv` to approve the TV certificate.")
+        return False
+
+    from .samsung.trust import SamsungTlsTrustError, load_trusted_certificate
+
+    try:
+        load_trusted_certificate(tls_pin)
+    except SamsungTlsTrustError as exc:
+        print(f"error: cannot install/start the service: Samsung TLS trust is not ready ({exc}).")
+        print(
+            "Run `atvr4samsung trust-tv`, inspect its SHA-256, then rerun "
+            "`atvr4samsung trust-tv --approve-sha256 <fingerprint>` before applying the service."
+        )
+        return False
+    return True
+
+
 def _probe_bind(port: int) -> tuple[bool, str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -303,13 +475,12 @@ def _probe_bind(port: int) -> tuple[bool, str]:
 
 def _probe_writable_dir(path) -> tuple[bool, str]:
     target = pathlib.Path(path).expanduser()
-    probe = target / ".doctor-write-test"
+    from .companion.protocol.atomic_io import probe_durable_directory
+
     try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe.write_text("ok")
-        probe.unlink()
+        target = probe_durable_directory(target)
         return True, f"{target} is writable"
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return False, f"{target} not writable ({exc})"
 
 
@@ -327,18 +498,22 @@ def _probe_zeroconf() -> tuple[bool, str]:
 
 
 async def _probe_tv(config: Config) -> tuple[bool, str]:
-    from .samsung.client import SamsungFrameClient
+    from .samsung.client import SamsungFrameClient, connect_failure_hint
 
     client = SamsungFrameClient(
         host=config.samsung.host, mac=config.samsung.mac, port=config.samsung.port,
-        name=config.samsung.name, token_file=config.samsung.token_file, connect_timeout=5.0,
+        name=config.samsung.name, token_file=config.samsung.token_file,
+        tls_certificate_file=config.samsung_tls_certificate_file, connect_timeout=5.0,
     )
     try:
         await client.connect()
         return True, f"connected to {config.samsung.host}:{config.samsung.port}"
     except Exception as exc:
-        reason = str(exc) or type(exc).__name__
-        return False, f"not reachable now ({reason}) — OK if the TV is asleep; it wakes on first command"
+        return (
+            False,
+            "not reachable now "
+            f"({connect_failure_hint(exc)}) — OK if the TV is asleep; it wakes on first command",
+        )
     finally:
         await client.close()
 
@@ -356,10 +531,6 @@ async def _cmd_doctor(config: Config) -> int:
     add("Samsung MAC set", mac.upper() not in ("", "AA:BB:CC:DD:EE:FF"),
         mac if mac.upper() not in ("", "AA:BB:CC:DD:EE:FF") else f"{mac or '(unset)'} — needed for Wake-on-LAN")
 
-    weak = pin_is_weak(config.companion.pin)
-    add("Pairing PIN", not weak,
-        "weak/guessable — set a stronger companion.pin" if weak else "looks strong", warn_only=True)
-
     local_ip = _detect_local_ip(config.samsung.host)
     add("Local LAN IP", local_ip != "0.0.0.0",
         local_ip if local_ip != "0.0.0.0" else "could not determine (interface down / no IPv4?)")
@@ -372,13 +543,47 @@ async def _cmd_doctor(config: Config) -> int:
     if config.companion.state_dir:
         add("State dir writable", *_probe_writable_dir(config.companion.state_dir))
     else:
-        add("State dir", True, "not set — pairing won't survive a restart", warn_only=True)
+        add("State dir", False, "required for persistent identity, paired devices, and enrollment")
 
     if config.samsung.token_file:
         add("Samsung token path", *_probe_writable_dir(pathlib.Path(config.samsung.token_file).parent))
 
+    tls_pin_ready = False
+    if config.samsung_tls_certificate_file is None:
+        add("Samsung TLS certificate pin", False, "requires companion.state_dir")
+    else:
+        from .samsung.trust import SamsungTlsTrustError, load_trusted_certificate
+
+        add(
+            "Samsung TLS pin parent",
+            *_probe_writable_dir(config.samsung_tls_certificate_file.parent),
+        )
+        try:
+            load_trusted_certificate(config.samsung_tls_certificate_file)
+        except SamsungTlsTrustError as exc:
+            add(
+                "Samsung TLS certificate pin",
+                False,
+                f"{exc}; run `atvr4samsung trust-tv`",
+            )
+        else:
+            tls_pin_ready = True
+            add(
+                "Samsung TLS certificate pin",
+                True,
+                f"{config.samsung_tls_certificate_file} is a readable 0600 pin",
+            )
+
     add("mDNS (Zeroconf)", *await asyncio.get_event_loop().run_in_executor(None, _probe_zeroconf))
-    add("Samsung TV reachable", *(await _probe_tv(config)), warn_only=True)
+    if tls_pin_ready:
+        add("Samsung TV reachable", *(await _probe_tv(config)), warn_only=True)
+    else:
+        add(
+            "Samsung TV reachable",
+            True,
+            "skipped until the required certificate pin is created",
+            warn_only=True,
+        )
 
     print("atvr4samsung doctor — network preflight\n")
     for label, ok, warn_only, detail in results:
@@ -393,30 +598,233 @@ async def _cmd_doctor(config: Config) -> int:
     return 0
 
 
+def _cmd_trust_tv(
+    config: Config,
+    *,
+    approved_sha256: Optional[str] = None,
+    fetcher=None,
+) -> int:
+    """Fetch a token-free TLS certificate for review and persist it only after exact approval."""
+    from .samsung.trust import (
+        SamsungTlsTrustError,
+        fetch_tv_certificate,
+        persist_trusted_certificate,
+    )
+
+    state_dir = _state_dir_for_management(config)
+    if state_dir is None:
+        return 2
+    pin_path = config.samsung_tls_certificate_file
+    assert pin_path is not None
+    fetch = fetcher or fetch_tv_certificate
+    try:
+        certificate = fetch(config.samsung.host, port=config.samsung.port)
+    except SamsungTlsTrustError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    print(f"Fetched Samsung TLS certificate SHA-256: {certificate.sha256}")
+    print("No token or WebSocket request was sent.")
+    if approved_sha256 is None:
+        print("No certificate pin was written.")
+        print(
+            "Inspect the fingerprint, then approve this exact certificate with:\n"
+            f"  atvr4samsung trust-tv --approve-sha256 {certificate.sha256}"
+        )
+        return 0
+
+    approved = approved_sha256.replace(":", "").strip().lower()
+    if approved != certificate.sha256:
+        print("error: --approve-sha256 does not match the fetched certificate; no pin was written.")
+        return 1
+    try:
+        persist_trusted_certificate(pin_path, certificate)
+    except (OSError, SamsungTlsTrustError) as exc:
+        print(f"error: could not save Samsung TLS certificate pin: {exc}")
+        return 1
+    print(f"Saved approved Samsung TLS certificate pin at {pin_path} (mode 0600).")
+    print("Restart the service if it is running so its next connection uses this pin.")
+    return 0
+
+
+def _state_dir_for_management(config: Config) -> Optional[pathlib.Path]:
+    if config.companion.state_dir is None:
+        print(
+            "error: companion.state_dir is required for controlled enrollment and paired-device "
+            "management; add it to config.yaml and retry."
+        )
+        return None
+    return config.companion.state_dir
+
+
+def _cmd_pair(config: Config, *, duration_seconds: float = DEFAULT_WINDOW_SECONDS) -> int:
+    """Open a fresh, temporary enrollment window and print its PIN exactly once."""
+    from .companion.protocol.identity_reset import IdentityResetInProgressError
+    from .companion.protocol.server_identity import (
+        MissingServerIdentityError,
+        ServerIdentityError,
+        load_persisted_identity_locked,
+    )
+
+    state_dir = _state_dir_for_management(config)
+    if state_dir is None:
+        return 2
+    store = PairingWindowStore(state_dir)
+    try:
+        # Keep identity lookup and publication under the same lock as reset/M5. `pair` must not
+        # manufacture an identity or race a reset into naming a daemon that is no longer current.
+        with store.transaction():
+            identity = load_persisted_identity_locked(state_dir)
+            window = store.open_locked(
+                server_identifier=identity.identifier,
+                server_generation=identity.generation,
+                duration_seconds=duration_seconds,
+            )
+    except IdentityResetInProgressError:
+        print(
+            "error: a pairing-state clear or reset is pending; restart the service to finish recovery before "
+            "retrying `atvr4samsung pair`."
+        )
+        return 1
+    except MissingServerIdentityError:
+        print(
+            "error: no persisted server identity; start or restart the service, then retry "
+            "`atvr4samsung pair`."
+        )
+        return 1
+    except ServerIdentityError:
+        print(
+            "error: the persisted server identity is corrupt or unreadable; run "
+            "`atvr4samsung unpair --reset-identity` (or restore a known-good identity), then restart "
+            "the service before retrying `atvr4samsung pair`."
+        )
+        return 1
+    except OSError:
+        # Either identity or window metadata can be visible despite a failed directory fsync. Do not
+        # reveal a PIN (or report success) until all strict pairing-state commits have returned.
+        print("error: pairing state was not durably committed; retry `atvr4samsung pair`.")
+        return 1
+    except ValueError:
+        print("error: enrollment window duration is invalid.")
+        return 1
+    expiry = datetime.fromtimestamp(window.expires_at).astimezone().isoformat(timespec="seconds")
+    print(f"Enrollment is open until {expiry}.")
+    print(f"Pairing PIN: {window.pin}")
+    print("Pair each new iPhone from Control Center → Apple TV Remote before expiry.")
+    return 0
+
+
+def _cmd_pairs(config: Config) -> int:
+    """List paired controller identifiers without exposing their public keys."""
+    from .companion.protocol.paired_clients import MAX_PAIRED_CLIENTS, PairedClients, PairedClientsError
+
+    state_dir = _state_dir_for_management(config)
+    if state_dir is None:
+        return 2
+    try:
+        with PairedClients(state_dir / "paired-clients.json") as store:
+            identifiers = store.identifiers()
+    except (OSError, PairedClientsError) as exc:
+        print(f"error: {exc}")
+        return 1
+    if not identifiers:
+        print(f"No paired devices (0/{MAX_PAIRED_CLIENTS}).")
+        return 0
+    print(f"Paired devices ({len(identifiers)}/{MAX_PAIRED_CLIENTS}):")
+    for identifier in identifiers:
+        print(f"  {identifier}")
+    return 0
+
+
+def _cmd_revoke(config: Config, identifier: str) -> int:
+    """Revoke one exact controller identifier."""
+    from .companion.protocol.paired_clients import PairedClients, PairedClientsError
+
+    state_dir = _state_dir_for_management(config)
+    if state_dir is None:
+        return 2
+    if not identifier:
+        print("error: revoke requires a paired-device identifier; run `atvr4samsung pairs` to list them.")
+        return 2
+    try:
+        with PairedClients(state_dir / "paired-clients.json") as store:
+            removed = store.remove(identifier)
+    except (OSError, PairedClientsError) as exc:
+        print(f"error: {exc}")
+        return 1
+    if removed:
+        print(f"Revoked paired device {identifier!r}.")
+    else:
+        print(f"No paired device matches {identifier!r}.")
+    return 0
+
+
 def _cmd_unpair(config: Config, *, reset_identity_too: bool = False) -> int:
-    from .companion.protocol.paired_clients import PairedClients
-    from .companion.protocol.server_identity import reset_identity
+    from .companion.protocol.identity_reset import (
+        begin_clear_all_locked,
+        begin_identity_reset_locked,
+        clear_clear_all_locked,
+    )
+    from .companion.protocol.paired_clients import PairedClients, PairedClientsError
+    from .companion.protocol.server_identity import reset_identity_locked
 
     state_dir = config.companion.state_dir
     if state_dir is None:
-        print("No companion.state_dir configured — pairing is ephemeral, nothing persisted to clear.")
+        print("No companion.state_dir configured — no controlled enrollment state exists to clear.")
         return 0
 
-    if PairedClients.clear_state(state_dir / "paired-clients.json"):
-        print("Cleared paired iPhone(s).")
-    else:
-        print("No paired clients on file.")
+    clear_all_checkpoint_owned = False
+    try:
+        # M5 revalidates and persists under this same transaction lock. Do not release it between
+        # closing enrollment, deleting clients, and deleting the server identity, or a verified M5
+        # could repopulate the store or a new window could name an identity being reset.
+        with PairingWindowStore(state_dir).transaction():
+            if reset_identity_too:
+                # This strict checkpoint must be durable before deleting any authorization state. A
+                # surviving daemon observes it immediately, and startup replays the sole reset path.
+                begin_identity_reset_locked(state_dir)
+            else:
+                # The common fence revokes live authorization before either unlink. Startup
+                # distinguishes the operation and preserves this identity after completing the clear.
+                clear_all_checkpoint_owned = begin_clear_all_locked(state_dir)
+            window_cleared = PairingWindowStore.clear_state_locked(state_dir)
+            clients_cleared = PairedClients.clear_state_locked(state_dir / "paired-clients.json")
+            identity_cleared = (
+                reset_identity_locked(state_dir) if reset_identity_too else False
+            )
+            if not reset_identity_too and clear_all_checkpoint_owned:
+                clear_clear_all_locked(state_dir)
 
-    if reset_identity_too:
-        if reset_identity(state_dir):
-            print("Regenerated server identity — the bridge now looks like a brand-new Apple TV.")
+        if window_cleared:
+            print("Closed the active enrollment window.")
+
+        if clients_cleared:
+            print("Cleared paired iPhone(s).")
         else:
-            print("No server identity on file to reset.")
+            print("No paired clients on file.")
 
-    print("On the iPhone: open the Apple TV Remote, remove this remote (\"Forget This Remote\"), then "
-          "pair again with your PIN. The Samsung token was left untouched.")
-    print("If the service is running, restart it for this to take effect: "
-          "sudo systemctl restart atvr4samsung")
+        if reset_identity_too:
+            if identity_cleared:
+                print(
+                    "Removed persisted server identity. Restart the service before opening a new "
+                    "enrollment window; it will create a new Apple TV identity."
+                )
+            else:
+                print("No server identity on file to reset.")
+    except (OSError, PairedClientsError) as exc:
+        print(f"error: pairing state was not durably cleared: {exc}")
+        return 1
+
+    print("The Samsung token and TLS pin were left untouched.")
+    if reset_identity_too or not clear_all_checkpoint_owned:
+        print(
+            "Restart the service so it creates and advertises a replacement Apple TV identity, then "
+            "run `atvr4samsung pair` and select the remote again on the iPhone."
+        )
+    else:
+        print("If the service is running, revocation takes effect before the old phone's next command; "
+              "no restart is required. Re-enrolling that same phone requires an identity reset because "
+              "iOS Control Center does not expose a remove-pairing action.")
     return 0
 
 
@@ -430,13 +838,23 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true",
                         help="with install-service: actually write + enable the unit (uses sudo)")
     parser.add_argument("--reset-identity", action="store_true",
-                        help="with unpair: also regenerate the server identity (the iPhone must "
-                             "'Forget This Remote' and re-pair)")
+                        help="with unpair: reset the Apple TV identity through a crash-safe checkpoint "
+                             "(restart the service, then forget and re-pair the iPhone)")
+    parser.add_argument("--minutes", type=float, default=DEFAULT_WINDOW_SECONDS / 60,
+                        help="with pair: enrollment window length in minutes (default: 5)")
+    parser.add_argument(
+        "--approve-sha256",
+        help="with trust-tv: exact SHA-256 fingerprint to approve and persist as the TV TLS pin",
+    )
     parser.add_argument("command", nargs="?",
-                        choices=["run", "init", "install-service", "doctor", "unpair"],
+                        choices=["run", "init", "install-service", "doctor", "trust-tv", "pair", "pairs",
+                                 "revoke", "unpair"],
                         default="run",
                         help="run (default), init config, print a systemd unit, doctor "
-                             "(network preflight), or unpair (clear paired iPhones)")
+                             "(network preflight), trust-tv (review/approve the Samsung TLS pin), "
+                             "pair (open enrollment), pairs (list devices), revoke <identifier>, "
+                             "or unpair (clear all devices)")
+    parser.add_argument("identifier", nargs="?", help="with revoke: exact paired-device identifier")
     args = parser.parse_args()
     # Expand ~ / $VARS once so every subcommand (and the default config path) resolves consistently.
     args.config = os.path.expanduser(os.path.expandvars(args.config))
@@ -445,6 +863,10 @@ def main() -> int:
         return _cmd_init(args.config)
     if args.command == "install-service":
         return _cmd_install_service(args.config, apply=args.apply)
+    if args.identifier and args.command != "revoke":
+        parser.error("a paired-device identifier is only valid with `revoke`")
+    if args.approve_sha256 and args.command != "trust-tv":
+        parser.error("--approve-sha256 is only valid with `trust-tv`")
 
     try:
         config = load_config(args.config)
@@ -458,11 +880,18 @@ def main() -> int:
     )
 
     if args.check:
-        _print_check(config)
-        return 0
+        return 0 if _print_check(config) else 1
 
     if args.command == "doctor":
         return asyncio.run(_cmd_doctor(config))
+    if args.command == "trust-tv":
+        return _cmd_trust_tv(config, approved_sha256=args.approve_sha256)
+    if args.command == "pair":
+        return _cmd_pair(config, duration_seconds=args.minutes * 60)
+    if args.command == "pairs":
+        return _cmd_pairs(config)
+    if args.command == "revoke":
+        return _cmd_revoke(config, args.identifier or "")
     if args.command == "unpair":
         return _cmd_unpair(config, reset_identity_too=args.reset_identity)
 
