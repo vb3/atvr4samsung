@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 # The server passes raw Companion ``_tPh`` codes; normalize them before ``feed``.
 TOUCH_ACTION_NAMES = {
     1: "press",
+    2: "hold",
     3: "hold",
     4: "release",
     5: "click",

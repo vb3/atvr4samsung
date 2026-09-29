@@ -18,8 +18,9 @@ from ..bridge.keymap import GESTURE_TO_SAMSUNG, Action, resolve
 
 _LOGGER = logging.getLogger(__name__)
 
-# Companion button-state values (``_hBtS``): 1 = down/press, 2 = up/release. Buttons act on release.
-_BUTTON_RELEASE = 2
+# Companion button-state values (``_hBtS``): 1 = down/press; iOS uses 2 for release while watchOS
+# uses 0 and can omit the down edge. Buttons act once on either release representation.
+_BUTTON_RELEASES = frozenset((0, 2))
 
 # A center tap arrives as BOTH a discrete Select button (``_hidC`` 6) and a touch tap that resolves to
 # SELECT — two KEY_ENTERs for one tap. Collapse a SELECT landing within this window of the previous
@@ -107,11 +108,11 @@ class CommandRelay:
     def on_button(self, hid_code: int, button_state: int) -> None:
         """Resolve a ``_hidC`` button and emit it once on **release** (matches a discrete click).
 
-        Presses are ignored; only the release edge fires. Volume Up/Down go through this same path —
-        one discrete ``KEY_VOL*`` step per press — because iOS doesn't stream a hold for them, so
-        there's no auto-repeat lifecycle to drive.
+        Presses are ignored; only an iOS/watchOS release edge fires. Volume Up/Down go through this
+        same path — one discrete ``KEY_VOL*`` step per press — because clients don't stream a hold
+        for them, so there's no auto-repeat lifecycle to drive.
         """
-        if button_state != _BUTTON_RELEASE:
+        if button_state not in _BUTTON_RELEASES:
             return
         mapping = resolve(hid_code)
         if mapping.action is Action.UNMAPPED:

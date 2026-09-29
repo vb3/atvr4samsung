@@ -188,6 +188,45 @@ def test_malformed_opack_is_tolerated_only_for_the_small_compatibility_budget():
     assert transport.closed
 
 
+def test_cleartext_noop_keepalive_does_not_consume_the_encrypted_nonce():
+    service, transport = _service()
+    server_out = b"s" * 32
+    client_out = b"c" * 32
+    service.chacha = chacha20.Chacha20Cipher(server_out, client_out, nonce_length=12)
+    client_cipher = chacha20.Chacha20Cipher(client_out, server_out, nonce_length=12)
+
+    for xid in range(5):
+        service.data_received(_frame(FrameType.NoOp, b""))
+        assert not transport.closed
+
+        system_info = {"client": "watchOS", "sequence": xid}
+        message = {"_i": "_systemInfo", "_x": xid, "_t": 2, "_c": system_info}
+        plaintext = opack.pack(message)
+        header = bytes([FrameType.E_OPACK.value]) + (len(plaintext) + 16).to_bytes(3, "big")
+        service.data_received(header + client_cipher.encrypt(plaintext, aad=header))
+
+        assert not transport.closed
+        assert service.session.system_info == system_info
+        assert len(transport.writes) == xid + 1
+    service.connection_lost(None)
+
+
+@pytest.mark.parametrize(
+    ("payload", "require_paired"),
+    [(b"not-an-encrypted-payload", False), (b"", True)],
+)
+def test_noop_does_not_bypass_decryption_or_paired_authorization(payload, require_paired):
+    service, transport = _service()
+    service.chacha = chacha20.Chacha20Cipher(b"s" * 32, b"c" * 32, nonce_length=12)
+    service._require_paired = require_paired
+
+    service.data_received(_frame(FrameType.NoOp, payload))
+
+    assert transport.closed
+    assert transport.writes == []
+    service.connection_lost(None)
+
+
 def test_pre_auth_idle_connection_expires():
     async def exercise() -> None:
         service, transport = _service(timeout=0.01)

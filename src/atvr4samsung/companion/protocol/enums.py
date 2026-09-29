@@ -97,6 +97,7 @@ class SystemStatus(Enum):
 
 class TouchAction(Enum):
     Press = 1
+    Move = 2
     Hold = 3
     Release = 4
     Click = 5

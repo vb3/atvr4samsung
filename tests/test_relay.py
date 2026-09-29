@@ -45,6 +45,11 @@ class TestButtonDecode(unittest.TestCase):
         self.assertEqual(sink[0].samsung_key, "KEY_HOME")
         self.assertEqual(sink[0].source, "button:7")
 
+    def test_watch_release_emits_mapped_key_without_down_edge(self):
+        relay, sink, _ = _relay()
+        relay.on_button(7, 0)  # watchOS Home release-only frame
+        self.assertEqual([command.samsung_key for command in sink], ["KEY_HOME"])
+
     def test_press_is_ignored_acts_on_release(self):
         relay, sink, _ = _relay()
         relay.on_button(7, 1)  # press

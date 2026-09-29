@@ -491,6 +491,11 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
                 _LOGGER.warning("Paired-client authorization changed; closing connection before dispatch")
                 self._close_connection()
                 return False
+            if frame_type is FrameType.NoOp and not frame_data:
+                # watchOS sends this idle keepalive outside the AEAD sequence. Decrypting its empty
+                # payload would consume a nonce and permanently desynchronize the next real frame.
+                _LOGGER.debug("Received cleartext Companion NoOp keepalive")
+                return self.transport is None or not self.transport.is_closing()
             try:
                 frame_data = self.chacha.decrypt(frame_data, aad=header)
             except Exception:
@@ -724,23 +729,21 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
 
     def handle__hidt(self, message):
         content = message["_c"]
-        press_mode: int = content["_tPh"]
+        touch_action = TouchAction(int(content["_tPh"]))
         # iOS 27.0.1 can omit the timestamp, and release frames can omit coordinates. These fields are
         # diagnostic state only; the phase is the sole required touch value.
-        ns = content.get("_ns", 0)
-        cx = content.get("_cx", 0)
-        cy = content.get("_cy", 0)
-        if press_mode == TouchAction.Press:
+        ns = int(content.get("_ns", 0))
+        cx = int(content.get("_cx", 0))
+        cy = int(content.get("_cy", 0))
+        if touch_action is TouchAction.Press:
             _LOGGER.debug("Touch event press to (%s, %s) at time %s", cx, cy, ns)
-        elif TouchAction.Hold:
+        elif touch_action in (TouchAction.Move, TouchAction.Hold):
             _LOGGER.debug("Touch event move to (%s, %s) at time %s", cx, cy, ns)
-        elif press_mode == TouchAction.Release:
+        elif touch_action is TouchAction.Release:
             _LOGGER.debug("Touch event release to (%s, %s) at time %s", cx, cy, ns)
-        elif press_mode == TouchAction.Click:
+        elif touch_action is TouchAction.Click:
             _LOGGER.debug("Touch event click to (%s, %s) at time %s", cx, cy, ns)
-        else:
-            _LOGGER.warning("Touch event mode not supported %s", press_mode)
-        self.session.touch_event = HidEvent(TouchAction(press_mode), cx, cy, ns)
+        self.session.touch_event = HidEvent(touch_action, cx, cy, ns)
 
     def handle__mcc(self, message):
         args = {}
