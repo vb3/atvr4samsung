@@ -16,7 +16,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, Optional
 
-from .protocol.enums import KeyboardFocusState, MediaControlCommand, MediaControlFlags
+from .protocol.enums import HidCommand, KeyboardFocusState, MediaControlCommand, MediaControlFlags
 from .protocol.guardrails import (
     AUTHENTICATION_TIMEOUT_SECONDS,
     ConnectionAdmission,
@@ -356,6 +356,10 @@ class BridgeCompanionService(FakeCompanionService):
     def handle_fetchupnextinfoevent(self, message):  # noqa: N802
         self.send_response(message, {})
 
+    def handle_fetchcurrenttopshelfitemsevent(self, message):  # noqa: N802
+        """Acknowledge the Top Shelf fetch added to iOS 27 session setup."""
+        self.send_response(message, {})
+
     def handle_tvrcsessionstart(self, message):  # noqa: N802
         """Ack the TV Remote session, then proactively push media-control flags.
 
@@ -433,6 +437,34 @@ class BridgeCompanionService(FakeCompanionService):
             # captions disabled so the response is well-formed.
             args["_cse"] = False
         self.send_response(message, args)
+
+    def handle__mcc(self, message):  # noqa: N802
+        """Relay the legacy media-control request shape used by watchOS."""
+        content = message.get("_c", {})
+        try:
+            command = MediaControlCommand(int(content["_mcc"]))
+        except (KeyError, TypeError, ValueError):
+            self._malformed_frame("malformed media-control command")
+            return
+
+        if command is MediaControlCommand.SetVolume:
+            level = content.get("_vol")
+            if not isinstance(level, (int, float)):
+                self._malformed_frame("malformed volume level")
+                return
+            key, self.state.volume = volume_key_for(self.state.volume, float(level))
+            self._relay.emit(Command(Action.SEND_KEY, key, source="mcc:SetVolume"))
+            self.send_response(message, {})
+            return
+
+        if command in (MediaControlCommand.Play, MediaControlCommand.Pause):
+            self._relay.emit(
+                Command(Action.SEND_KEY, "KEY_PLAY_BACK", source=f"mcc:{command.name}")
+            )
+            self.send_response(message, {})
+            return
+
+        super().handle__mcc(message)
 
     def handle__touchstart(self, message):  # noqa: N802
         """Answer the touchpad-session start with a touch device ID — the blocker that disconnected
@@ -594,12 +626,29 @@ class BridgeCompanionService(FakeCompanionService):
     # -- decode overrides: call the base handler, then relay --------------
 
     def handle__hidc(self, message):  # noqa: N802 (name dictated by the Companion method id)
-        super().handle__hidc(message)
         try:
             content = message["_c"]
-            self._relay.on_button(int(content["_hidC"]), int(content["_hBtS"]))
+            hid_code = int(content["_hidC"])
+            button_state = int(content["_hBtS"])
         except Exception:  # never let malformed input break the protocol loop
             self._malformed_frame("malformed HID button")
+            return
+
+        if button_state == 0:
+            # watchOS can send a release without a preceding down edge, notably for Play/Pause. The
+            # base 1/2 state machine rejects that shape, which makes the Watch retry the request.
+            try:
+                button_code = HidCommand(hid_code)
+            except ValueError:
+                self._malformed_frame("malformed HID button")
+                return
+            self._pressed_buttons.discard(button_code)
+            self.send_response(message, {})
+            self._relay.on_button(hid_code, button_state)
+            return
+
+        super().handle__hidc(message)
+        self._relay.on_button(hid_code, button_state)
 
     def handle__hidt(self, message):  # noqa: N802
         # Base decode only logs + records state (no response to preserve); isolate it so a malformed

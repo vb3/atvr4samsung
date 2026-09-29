@@ -5,9 +5,9 @@ Two behaviors are pinned here:
 * The Siri/mic HID button is *acked empty* and never treated as an "Unhandled command", and it never
   wedges ``_pressed_buttons`` (iOS sends states 0/1/2 for it). A real Apple TV opens a voice session;
   we have no audio path to the Frame TV, so we ack and drop it.
-* The benign fire-and-forget events iOS pushes during a Control Center session (PublishPresence,
-  SwitchActiveUserAccount, FetchUpNextInfo) are acked with an empty success response instead of the
-  RPError the base loop used to return (which spammed ~340 warnings/week and made the phone re-send).
+* The benign events iOS sends during a Control Center session (PublishPresence,
+  SwitchActiveUserAccount, FetchUpNextInfo, and iOS 27's FetchCurrentTopShelfItems) are acked with an
+  empty success response instead of the RPError the base loop used to return.
 
 Both use the base/subclass handlers directly via ``__new__`` (stdlib-only, no Apple TV, no network).
 """
@@ -18,6 +18,7 @@ import types
 from atvr4samsung.companion.protocol import appletv as atv
 from atvr4samsung.companion.protocol.enums import HidCommand
 from atvr4samsung.companion import server as srv
+from atvr4samsung.companion.relay import CommandRelay
 
 
 def _make_hid_service():
@@ -63,8 +64,81 @@ def test_mapped_button_still_relays_after_siri_change():
     assert HidCommand.Select not in svc._pressed_buttons
 
 
-def test_benign_pushed_events_are_acked_empty():
-    for ident in ("PublishPresenceEvent", "SwitchActiveUserAccountEvent", "FetchUpNextInfoEvent"):
+def test_watch_release_only_button_is_acked_and_relayed():
+    svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
+    svc._pressed_buttons = set()
+    commands = []
+    responses = []
+    svc._relay = CommandRelay(commands.append)
+    svc.send_response = lambda message, content: responses.append(content)
+
+    svc.handle__hidc(_hidc(HidCommand.PlayPause.value, 0))
+
+    assert responses == [{}]
+    assert [command.samsung_key for command in commands] == ["KEY_PLAY_BACK"]
+
+
+def test_watch_release_clears_a_recorded_down_edge():
+    svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
+    svc._pressed_buttons = {HidCommand.Home}
+    svc._relay = CommandRelay(lambda command: None)
+    svc.send_response = lambda message, content: None
+
+    svc.handle__hidc(_hidc(HidCommand.Home.value, 0))
+
+    assert HidCommand.Home not in svc._pressed_buttons
+
+
+def test_watch_and_ios_mapped_controls_emit_once():
+    for states in ((0,), (1, 2)):
+        for code, key in (
+            (HidCommand.Menu, "KEY_RETURN"),
+            (HidCommand.Home, "KEY_HOME"),
+            (HidCommand.VolumeUp, "KEY_VOLUP"),
+            (HidCommand.VolumeDown, "KEY_VOLDOWN"),
+            (HidCommand.PlayPause, "KEY_PLAY_BACK"),
+        ):
+            svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
+            svc.session = atv.FakeCompanionSessionState(svc)
+            svc._pressed_buttons = svc.session.pressed_buttons
+            svc.state = atv.FakeCompanionState()
+            commands, responses, errors = [], [], []
+            svc._relay = CommandRelay(commands.append)
+            svc.send_response = lambda message, content: responses.append(content)
+            svc.send_error = lambda *args, **kwargs: errors.append(args)
+            svc.send_event = lambda *args, **kwargs: None
+
+            for state in states:
+                svc.handle__hidc(_hidc(code.value, state))
+
+            assert [command.samsung_key for command in commands] == [key], (code, states)
+            assert responses == [{}] * len(states)
+            assert errors == []
+            assert not svc._pressed_buttons
+
+
+def test_unknown_watch_button_is_not_acked_or_relayed():
+    svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
+    svc._pressed_buttons = set()
+    commands, responses, malformed = [], [], []
+    svc._relay = CommandRelay(commands.append)
+    svc.send_response = lambda message, content: responses.append(content)
+    svc._malformed_frame = lambda reason: malformed.append(reason)
+
+    svc.handle__hidc(_hidc(999, 0))
+
+    assert commands == []
+    assert responses == []
+    assert malformed == ["malformed HID button"]
+
+
+def test_benign_session_events_are_acked_empty():
+    for ident in (
+        "PublishPresenceEvent",
+        "SwitchActiveUserAccountEvent",
+        "FetchUpNextInfoEvent",
+        "FetchCurrentTopShelfItemsEvent",
+    ):
         svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
         captured: dict = {}
         svc.send_response = lambda message, content: captured.update(content=content)

@@ -14,6 +14,7 @@ from atvr4samsung.bridge.keymap import Action
 from atvr4samsung.companion import server as srv
 from atvr4samsung.companion.dispatch import CommandDispatchLane
 from atvr4samsung.companion.protocol.appletv import FakeCompanionSessionState
+from atvr4samsung.companion.protocol.enums import TouchAction
 from atvr4samsung.companion.relay import Command, RepeatPhase
 from atvr4samsung.companion.repeater import HoldRepeater, HoldRepeatConfig
 from atvr4samsung.samsung.client import SamsungFrameClient
@@ -433,6 +434,20 @@ class TestSparseTouchCompatibility(unittest.TestCase):
         svc._relay = types.SimpleNamespace(on_touch=lambda *args: calls.append(args))
         return svc, calls, malformed
 
+    def test_current_and_legacy_move_without_timestamp_reach_relay(self):
+        for phase, expected in (("2", TouchAction.Move), ("3", TouchAction.Hold)):
+            with self.subTest(phase=phase):
+                svc, calls, malformed = self._service()
+
+                svc.handle__hidt({"_c": {"_tPh": phase, "_cx": "640", "_cy": "480"}})
+
+                self.assertEqual(malformed, [])
+                self.assertEqual(calls, [("hold", 640, 480)])
+                self.assertEqual(svc.session.touch_event.press_mode, expected)
+                self.assertEqual(svc.session.touch_event.x, 640)
+                self.assertEqual(svc.session.touch_event.y, 480)
+                self.assertEqual(svc.session.touch_event.ns, 0)
+
     def test_touch_without_optional_timestamp_is_not_malformed(self):
         svc, calls, malformed = self._service()
 
@@ -445,9 +460,10 @@ class TestSparseTouchCompatibility(unittest.TestCase):
     def test_release_with_missing_coords_still_reaches_relay(self):
         svc, calls, malformed = self._service()
 
-        svc.handle__hidt({"_c": {"_tPh": 4}})  # release phase, no coordinates present
+        for _ in range(3):
+            svc.handle__hidt({"_c": {"_tPh": 4}})  # release phase, no coordinates present
 
-        self.assertEqual(calls, [("release", 0, 0)])
+        self.assertEqual(calls, [("release", 0, 0)] * 3)
         self.assertEqual(malformed, [])
 
 

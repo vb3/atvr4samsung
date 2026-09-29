@@ -119,10 +119,10 @@ class TestMalformedAndStateHandling(unittest.TestCase):
         # A stale unreleased touch must not contaminate the next gesture.
         self.assertEqual(swipe(t, 500, 500, 500, 850), ["DOWN"])
 
-    def test_touch_action_name_table_matches_pyatv_values(self):
-        # Guards the integer contract with pyatv's TouchAction enum (Press/Hold/Release/Click).
+    def test_touch_action_name_table_accepts_current_and_legacy_move_phases(self):
+        # Current Apple clients use phase 2 for movement; phase 3 remains a compatible hold update.
         self.assertEqual(
-            TOUCH_ACTION_NAMES, {1: "press", 3: "hold", 4: "release", 5: "click"}
+            TOUCH_ACTION_NAMES, {1: "press", 2: "hold", 3: "hold", 4: "release", 5: "click"}
         )
 
 

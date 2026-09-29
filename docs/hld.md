@@ -200,6 +200,9 @@ Update [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) whenever depende
   Home, swipes (incl. **swipe-and-hold auto-repeat**), Play/Pause toggle, **Volume Up/Down + Mute**,
   **Power**, **keyboard text entry into the TV's system fields** (search/browser via the Tizen IME),
   auto-reconnect on stale session.
+- **Apple client compatibility:** watchOS idle NoOp keepalives, release-only buttons, and legacy
+  Crown/media commands; iOS 27 Top Shelf startup acknowledgment; current phase-2 and legacy phase-3
+  movement with sparse touch timestamps/release coordinates.
 - **Known limits:** Wake-on-LAN is unreliable on 2021+ Frames (magic packet often ignored even with
   "Power On with Mobile" on) — see `operations.md`. Keyboard input works only in apps that use the TV's
   **system IME**; apps with their own keyboard (YouTube, Netflix) emit no IME events and ignore it.

@@ -181,10 +181,20 @@ declaration closes the socket before its declared attacker-controlled payload is
 `ServerEncrypt-main` (our outgoing) / `ClientEncrypt-main` (incoming), 12-byte little-endian
 per-direction sequence nonce, AAD = the 4-byte frame header. A decrypt failure is **unrecoverable**
 for that session (the nonce counters have diverged) — the server closes the connection (§6).
+After pair-verify, watchOS can send an empty cleartext `NoOp` as an idle keepalive. It is authenticated
+by the live paired connection but sits outside the AEAD message sequence, so the server accepts it
+without decrypting it or consuming the inbound nonce counter.
 
 **Session/command layer (`E_OPACK`):** OPACK-encoded dicts keyed by `_i` (identifier/method), `_c`
 (content), `_t` (type: 1=event, 2=request, 3=response), `_x` (transaction id). The server dispatches
-by `_i.lower()` to `handle_<name>` methods.
+by `_i.lower()` to `handle_<name>` methods. watchOS startup can also send a response without `_i`,
+for example `{"_t": 3, "_x": 1234, "_rT": 0, "_c": {}}`. After authorization, AEAD decryption,
+payload-size validation, OPACK decoding, and the pre-authentication guard, the server ignores a
+dictionary with no `_i` only when `_t` is integer `3` and `_x` is an integer transaction ID
+(including OPACK's sized integers, but not booleans). It sends no reply, dispatches no command, and
+leaves the malformed-frame budget unchanged. Unlike the cleartext NoOp exception, this is a normal
+encrypted frame and consumes its normal inbound nonce. Missing/invalid type or transaction fields,
+and present non-string identifiers, retain the existing malformed-message handling.
 
 ### TCP guardrails and protocol privacy
 
@@ -227,10 +237,11 @@ or redaction behavior. Notable bridge overrides:
   `deviceCapabilitiesV2` binary-plist quirk), then closes on the third; a ChaCha decrypt failure still closes
   immediately so the client re-pairs.
 - `handle__hidc` — decode `{_hBtS, _hidC}` button frames; resolve via `bridge/keymap.resolve()` and
-  dispatch. Buttons act on **release** (`_hBtS=2`) and de-dupe a SELECT that double-fires within
-  400 ms (a center tap arrives as both a discrete Select and a touch click). Volume Up/Down go through
-  this same release path — one discrete `KEY_VOL*` step per press — because iOS doesn't stream a hold
-  for them (§4). The **Siri/mic button**
+  dispatch. Buttons act on **release** (`_hBtS=2` from iOS or `0` from watchOS); the watchOS form may
+  arrive without a preceding down edge and is acknowledged directly. SELECT is de-duped when it
+  double-fires within 400 ms (a center tap arrives as both a discrete Select and a touch click).
+  Volume Up/Down go through this same release path — one discrete `KEY_VOL*` step per press — because
+  iOS doesn't stream a hold for them (§4). The **Siri/mic button**
   (`_hidC` 10) is acked with an empty response and ignored — a real Apple TV opens a voice-capture
   session we have no audio path to relay; it's dropped from the pressed-button set so it can't wedge
   state. (Prior to v0.8.2 it fell through to a per-tap `Unhandled command` warning with no ack.)
@@ -239,7 +250,13 @@ or redaction behavior. Notable bridge overrides:
   each with an empty success response (`handle_publishpresenceevent` etc.). The base loop otherwise
   had no handler and replied with an RPError plus a warning on every push (~340/week); the phone
   simply re-sent. An empty `FetchUpNextInfo` ack is truthful — nothing is playing.
-- `handle__hidt` / `handle__touchstart` — touch session. `_touchStart` **must** reply with a touch
+- **iOS 27 Top Shelf fetch** — iOS 27 requests `FetchCurrentTopShelfItemsEvent` while opening the
+  remote. Returning an unsupported-handler RPError leaves the client waiting and it closes the TVRC
+  session about ten seconds later. The bridge has no browsable app catalog, so
+  `handle_fetchcurrenttopshelfitemsevent` returns an empty success response.
+- `handle__hidt` / `handle__touchstart` — touch session. Current iOS/watchOS movement uses
+  `_tPh=2`; legacy phase `3` remains an in-progress hold/move update. The optional `_ns` timestamp
+  and omitted release coordinates default to zero. `_touchStart` **must** reply with a touch
   device id under `_c['_i']` (we send `{"_i": 1}`); an empty reply makes iOS fail the touch session
   (`RPErrorDomain -6762 "No touch device ID"`) and tear down the whole remote.
 - `handle_tvrcsessionstart` / `handle_fetchmediacontrolstatus` / `handle__interest` — advertise media
@@ -247,6 +264,9 @@ or redaction behavior. Notable bridge overrides:
 - `handle_mediacontrolcommand` — iOS-26 `MediaControlCommand` flow (GetVolume/SetVolume/captions).
   A SetVolume (slider/button) level is compared to our last level and relayed as one discrete Samsung
   step; the level is mirrored back so the slider stays live (§4).
+- `handle__mcc` — legacy media-control flow still used by watchOS. Crown `SetVolume` becomes one
+  discrete Samsung volume step; `Play` and `Pause` both become the Frame's stateless
+  `KEY_PLAY_BACK` toggle. Other legacy commands retain the base behavior.
 - `handle__tistart` — establish the RTI text-input session and register as an RTI client, but reply
   **unfocused** so iOS doesn't pop the keyboard on connect; focus is driven later by the TV's IME.
 - `handle__tic` — decode the iOS text operation (insert / `deletionCount` backspace / `textToAssert`
@@ -419,7 +439,8 @@ Mechanics:
   shared websocket.
 
 
-touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). Observed on **iOS 27.0.1**:
+touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press, 2=move, 3=legacy hold/move, 4=release).
+The optional `_ns` timestamp is not needed for gesture resolution. Observed on **iOS 27.0.1**:
 the `_ns` timestamp may be absent, and release frames may omit coordinates. Missing optional values
 are recorded as zero so they do not count toward the malformed-frame disconnect threshold. The
 translator resolves a press→release into a **tap** (total travel ≤ `tap_max_travel`=60 → SELECT) or a
@@ -475,6 +496,9 @@ against the TVRemoteCore decompile **and** a real Apple TV 4K (tvOS 26.5).
   `Decrypt failed`. The server **closes the connection**; iOS reconnects and re-runs pair-verify
   automatically. (We considered server-side TCP keepalive but a tcpdump of an idle real-ATV
   connection showed **no** server keepalives, so we don't add any — Rapport drives liveness.)
+- An Apple Watch idle connection may instead send an empty cleartext Companion `NoOp`. It is a
+  client keepalive outside the encrypted nonce sequence; accepting it without AEAD processing keeps
+  the following encrypted command synchronized.
 - **Overlapping connections:** device-wide media facts remain shared, but every TCP protocol owns its
   own TVRC/RTI/input state. Teardown unregisters and invalidates that session exactly once; an old
   connection that loses the race with its replacement is therefore excluded from later TV-IME RTI

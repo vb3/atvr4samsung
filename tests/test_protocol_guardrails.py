@@ -16,8 +16,10 @@ from atvr4samsung.companion.protocol.guardrails import (
     PairFailureLimiter,
     PairSetupAttemptLimiter,
 )
+from atvr4samsung.companion.protocol.paired_clients import PairedClients
 from atvr4samsung.companion.protocol.tlv8 import ErrorCode, TlvValue, read_tlv, write_tlv
 from atvr4samsung.companion.protocol.support import hkdf_expand
+from atvr4samsung.companion.relay import CommandRelay
 from atvr4samsung.companion.server import BridgeCompanionService
 
 _TEST_LOOP: asyncio.AbstractEventLoop | None = None
@@ -30,6 +32,12 @@ def _frame(frame_type: FrameType | int, payload: bytes) -> bytes:
 
 def _auth_frame(frame_type: FrameType, tlv: dict) -> bytes:
     return _frame(frame_type, opack.pack({"_pd": write_tlv(tlv)}))
+
+
+def _encrypted_frame(cipher: chacha20.Chacha20Cipher, message: object) -> bytes:
+    plaintext = opack.pack(message)
+    header = bytes([FrameType.E_OPACK.value]) + (len(plaintext) + 16).to_bytes(3, "big")
+    return header + cipher.encrypt(plaintext, aad=header)
 
 
 class _Transport:
@@ -98,6 +106,9 @@ class _OpenWindow:
 
 def _service(
     *,
+    service_type: type[FakeCompanionService] = FakeCompanionService,
+    paired_clients=None,
+    require_paired: bool = False,
     admission=None,
     timeout=0.0,
     source: str = "192.0.2.10",
@@ -113,8 +124,10 @@ def _service(
         if _TEST_LOOP is None or _TEST_LOOP.is_closed():
             _TEST_LOOP = asyncio.new_event_loop()
         asyncio.set_event_loop(_TEST_LOOP)
-    service = FakeCompanionService(
+    service = service_type(
         FakeCompanionState(),
+        paired_clients=paired_clients,
+        require_paired=require_paired,
         admission=admission,
         authentication_timeout=timeout,
         pairing_window=pairing_window,
@@ -186,6 +199,181 @@ def test_malformed_opack_is_tolerated_only_for_the_small_compatibility_budget():
     assert not transport.closed
     service.data_received(malformed)
     assert transport.closed
+
+
+def test_cleartext_noop_keepalive_does_not_consume_the_encrypted_nonce():
+    service, transport = _service()
+    server_out = b"s" * 32
+    client_out = b"c" * 32
+    service.chacha = chacha20.Chacha20Cipher(server_out, client_out, nonce_length=12)
+    client_cipher = chacha20.Chacha20Cipher(client_out, server_out, nonce_length=12)
+
+    for xid in range(5):
+        service.data_received(_frame(FrameType.NoOp, b""))
+        assert not transport.closed
+
+        system_info = {"client": "watchOS", "sequence": xid}
+        message = {"_i": "_systemInfo", "_x": xid, "_t": 2, "_c": system_info}
+        plaintext = opack.pack(message)
+        header = bytes([FrameType.E_OPACK.value]) + (len(plaintext) + 16).to_bytes(3, "big")
+        service.data_received(header + client_cipher.encrypt(plaintext, aad=header))
+
+        assert not transport.closed
+        assert service.session.system_info == system_info
+        assert len(transport.writes) == xid + 1
+    service.connection_lost(None)
+
+
+@pytest.mark.parametrize(
+    ("payload", "require_paired"),
+    [(b"not-an-encrypted-payload", False), (b"", True)],
+)
+def test_noop_does_not_bypass_decryption_or_paired_authorization(payload, require_paired):
+    service, transport = _service()
+    service.chacha = chacha20.Chacha20Cipher(b"s" * 32, b"c" * 32, nonce_length=12)
+    service._require_paired = require_paired
+
+    service.data_received(_frame(FrameType.NoOp, payload))
+
+    assert transport.closed
+    assert transport.writes == []
+    service.connection_lost(None)
+
+
+@pytest.mark.parametrize("initial_malformed", [0, 1])
+@pytest.mark.parametrize("message_type", [1, 2])
+def test_identifier_free_responses_preserve_session_and_following_dispatch(
+    initial_malformed, message_type
+):
+    async def exercise() -> None:
+        service, transport = _service(service_type=BridgeCompanionService)
+        commands = []
+        service._relay = CommandRelay(commands.append)
+        service.enable_encryption(b"s" * 32, b"c" * 32)
+        client = chacha20.Chacha20Cipher(b"c" * 32, b"s" * 32, nonce_length=12)
+        service._malformed_frames = initial_malformed
+        try:
+            # Larger IDs decode as OPACK's sized-int subclasses, not plain Python ints.
+            for xid in (0, 39, 40, 1234, 2**32, 2**64 - 1):
+                response = {"_t": 3, "_x": xid, "_rT": 0, "_c": {}}
+                service.data_received(_encrypted_frame(client, response))
+
+                assert not transport.closed
+                assert service._malformed_frames == initial_malformed
+                assert transport.writes == []
+                assert commands == []
+
+            request = {
+                "_i": "_hidC", "_t": message_type, "_x": 1235,
+                "_c": {"_hidC": 7, "_hBtS": 0},
+            }
+            service.data_received(_encrypted_frame(client, request))
+
+            assert not transport.closed
+            assert service._malformed_frames == initial_malformed
+            assert [command.samsung_key for command in commands] == ["KEY_HOME"]
+            assert len(transport.writes) == 1
+            wire = transport.writes[0]
+            reply, remaining = opack.unpack(client.decrypt(wire[4:], aad=wire[:4]))
+            assert remaining == b""
+            assert reply == {"_i": "_hidC", "_t": 3, "_x": 1235, "_c": {}}
+        finally:
+            service.connection_lost(None)
+            if service._teardown_task is not None:
+                await service._teardown_task
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        None,
+        [],
+        {},
+        {"_x": 1234},
+        {"_t": 1, "_x": 1234},
+        {"_t": 2, "_x": 1234},
+        {"_t": True, "_x": 1234},
+        {"_t": "3", "_x": 1234},
+        {"_t": 3.0, "_x": 1234},
+        {"_t": 3},
+        {"_t": 3, "_x": None},
+        {"_t": 3, "_x": True},
+        {"_t": 3, "_x": False},
+        {"_t": 3, "_x": "1234"},
+        {"_t": 3, "_x": 1234.0},
+        {"_t": 3, "_x": []},
+        {"_i": None, "_t": 3, "_x": 1234},
+        {"_i": 7, "_t": 3, "_x": 1234},
+    ],
+)
+def test_invalid_identifier_free_envelopes_still_consume_malformed_budget(message):
+    service, transport = _service()
+    service.enable_encryption(b"s" * 32, b"c" * 32)
+    client = chacha20.Chacha20Cipher(b"c" * 32, b"s" * 32, nonce_length=12)
+    try:
+        for count in range(1, 4):
+            service.data_received(_encrypted_frame(client, message))
+            assert service._malformed_frames == count
+            assert transport.closed == (count == 3)
+            assert transport.writes == []
+    finally:
+        service.connection_lost(None)
+
+
+def test_identifier_free_responses_are_not_accepted_before_authentication():
+    service, transport = _service()
+    response = {"_t": 3, "_x": 1234, "_rT": 0, "_c": {}}
+    try:
+        for count in range(1, 4):
+            service.data_received(_frame(FrameType.E_OPACK, opack.pack(response)))
+            assert service._malformed_frames == count
+            assert transport.closed == (count == 3)
+            assert transport.writes == []
+    finally:
+        service.connection_lost(None)
+
+
+def test_identifier_free_response_closes_a_revoked_client():
+    with PairedClients(None) as paired:
+        identifier, public_key = "watch", b"p" * 32
+        paired.add(identifier, public_key)
+        service, transport = _service(paired_clients=paired, require_paired=True)
+        service._verified_client_identifier = identifier
+        service._verified_client_ltpk = public_key
+        service.enable_encryption(b"s" * 32, b"c" * 32)
+        client = chacha20.Chacha20Cipher(b"c" * 32, b"s" * 32, nonce_length=12)
+        response = {"_t": 3, "_x": 1234, "_rT": 0, "_c": {}}
+        try:
+            service.data_received(_encrypted_frame(client, response))
+            assert not transport.closed
+            assert service._malformed_frames == 0
+
+            assert paired.remove(identifier)
+            service.data_received(_encrypted_frame(client, response))
+
+            assert transport.closed
+            assert service._malformed_frames == 0
+            assert transport.writes == []
+        finally:
+            service.connection_lost(None)
+
+
+def test_identifier_free_response_does_not_bypass_aead_verification():
+    service, transport = _service()
+    service.enable_encryption(b"s" * 32, b"c" * 32)
+    client = chacha20.Chacha20Cipher(b"c" * 32, b"s" * 32, nonce_length=12)
+    wire = _encrypted_frame(client, {"_t": 3, "_x": 1234, "_c": {}})
+    tampered = wire[:-1] + bytes([wire[-1] ^ 1])
+    try:
+        service.data_received(tampered)
+
+        assert transport.closed
+        assert service._malformed_frames == 0
+        assert transport.writes == []
+    finally:
+        service.connection_lost(None)
 
 
 def test_pre_auth_idle_connection_expires():
