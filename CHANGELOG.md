@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog: https://keepachangelog.com/
 
+## [2.1.2] - Unreleased
+
+### Changed
+
+- Require version-matched changelog entries and synchronized package/lockfile versions in the
+  contribution guide and pull request checklist.
+- Reject missing, duplicate, or empty release-note sections in CI and before release publication,
+  instead of publishing generic fallback notes.
+
+### Fixed
+
+- Backfilled the published 2.0.3 and 2.1.1 release changes and contributor credits. This version
+  changes release documentation and validation only; remote-control behavior is unchanged.
+
+## [2.1.1] - 2026-09-29
+
+### Added
+
+- Added watchOS compatibility for empty Companion NoOp keepalives, release-only HID buttons,
+  Digital Crown volume requests, and legacy play/pause commands.
+- Added current phase-2 touch movement while retaining legacy phase-3 hold/move support.
+- Acknowledge the iOS 27 Top Shelf startup fetch without requiring an app catalog.
+
+### Fixed
+
+- Preserve encrypted-session nonce synchronization after watchOS cleartext keepalives, without
+  bypassing paired-client authorization.
+- Retain sparse touch timestamp and release-coordinate defaults while accepting numeric-string
+  touch fields, preventing valid releases from exhausting the malformed-frame budget.
+- Ignore valid encrypted Companion responses that omit a method identifier, without replying,
+  relaying a command, or consuming the malformed-frame allowance. Invalid envelopes and revoked
+  clients remain rejected; authentication and encryption behavior are unchanged.
+
+### Contributors
+
+- Thank you @balint777 (Csonka Balint) for #1, #2, #3, and #4, consolidated in #5, and for the
+  additional [identifier-free response fix](https://github.com/balint777/atvr4samsung-haos/commit/8fc8c3a295c72336d5a90d2de484f22b63790e09).
+  Only that response handling was adapted from the additional upstream commit.
+
+The intermediate 2.1.0 PR build was used for live testing, not published as a separate release.
+
+## [2.0.3] - 2026-09-29
+
+### Fixed
+
+- Accept iOS 27.0.1 touch frames without timestamps and release frames without coordinates,
+  preventing otherwise valid input from counting toward the malformed-frame disconnect limit.
+- Synchronize the package version in the locked environment so release validation succeeds.
+
+The intermediate 2.0.2 code version was not published as a separate release.
+
 ## [2.0.1] - 2026-07-18
 
 ### Fixed

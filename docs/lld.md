@@ -50,6 +50,14 @@ tests/                   stdlib-runnable unit tests for the pure layers + protoc
 
 ### Container release contract
 
+Every version bump updates `pyproject.toml`, `uv.lock`, and a matching `CHANGELOG.md` section in
+the same change. `scripts/release_notes.py` extracts exactly one section for the requested version
+(the package version by default) and requires at least one nonempty change bullet; headings and
+HTML comments alone do not count. Missing, duplicate, or empty sections fail CI and the release
+decision before any registry publication. The release job uses the same extractor for its notes,
+with no generic fallback. Unreleased intermediate versions are folded into the next published
+release; correcting published notes never replaces its tag or attested artifacts.
+
 Each stable `X.Y.Z` release publishes one multi-platform OCI image and one deployment bundle:
 
 - `ghcr.io/vb3/atvr4samsung:X.Y.Z`, with `linux/amd64` and `linux/arm64` manifests;

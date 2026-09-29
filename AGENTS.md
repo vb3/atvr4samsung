@@ -130,8 +130,17 @@ The code should read for itself; comments earn their place by adding what the co
 - **Bump the version every commit.** Increment `version` in `pyproject.toml` on each commit — patch
   level for routine changes, minor/major per semver for features/breaking changes. It is the single
   source of truth; `src/atvr4samsung/__init__.py` derives `__version__` from package metadata, so
-  only `pyproject.toml` changes. Every strictly newer stable version publishes the multi-platform OCI
-  image and deployment bundle.
+  update `pyproject.toml` and regenerate `uv.lock` together. Every strictly newer stable version
+  publishes the multi-platform OCI image and deployment bundle.
+- **Update the changelog with every version bump, in the same change.** Add a matching
+  `CHANGELOG.md` section with concrete user-visible changes (or explicitly identify documentation/
+  release-process-only changes), and credit external contributors. Fold unreleased intermediate
+  versions into the next published release instead of presenting them as separate releases. Use
+  `Unreleased` while a version is pending; published backfills use the actual release date.
+  `python -I -S scripts/release_notes.py` must find exactly one matching section with a nonempty
+  change bullet. CI and release publication reject missing, duplicate, or empty notes; never replace
+  them with generic release text. Before publishing, review the extracted notes. Correct published
+  notes in place without moving tags or replacing immutable artifacts.
 - Update `docs/hld.md` / `docs/lld.md` / `docs/operations.md` when the design, protocol, mappings, or
   ops change (see "Keep the docs current" above); update this file when a convention changes.
 - Co-author trailer for AI-assisted commits is fine; never put secrets in commit messages.
