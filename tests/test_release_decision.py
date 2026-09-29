@@ -71,6 +71,27 @@ class TestReleaseArtifactMetadata(unittest.TestCase):
 class TestContainerReleaseWorkflow(unittest.TestCase):
     """The image and its attestations must exist before an immutable release is published."""
 
+    def test_changelog_validation_precedes_ci_and_release_publication(self):
+        ci = (_ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        workflow = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+        self.assertLess(
+            ci.index("run: python -I -S scripts/release_notes.py > /dev/null"),
+            ci.index("      - name: Install\n"),
+        )
+        self.assertLess(
+            workflow.index('python -I -S scripts/release_notes.py "$current" > /dev/null'),
+            workflow.index('decision="$(python -I -S scripts/release_decision.py'),
+        )
+        self.assertLess(
+            workflow.index('run: python -I -S scripts/release_notes.py "$VERSION" > notes.md'),
+            workflow.index("      - name: Log in to GHCR"),
+        )
+        self.assertIn("--notes-file notes.md", workflow)
+        self.assertNotIn("Container release %s.", workflow)
+        self.assertNotIn("continue-on-error", ci)
+        self.assertNotIn("continue-on-error", workflow)
+
     def test_container_artifacts_are_attested_before_publication(self):
         workflow = (_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         steps = list(
