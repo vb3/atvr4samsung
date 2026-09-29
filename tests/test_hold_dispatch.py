@@ -423,19 +423,32 @@ class TestTouchStopEndsHold(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(svc._teardown_task, 1)
 
 
-class TestReleaseFailsClosed(unittest.TestCase):
-    def test_release_with_missing_coords_still_reaches_relay(self):
-        # A malformed release (no _cx/_cy/_ns) must not stop the release from reaching the relay —
-        # otherwise a hold could never be STOPped by it. The base decode is isolated and coords default
-        # to 0, so the release still propagates.
+class TestSparseTouchCompatibility(unittest.TestCase):
+    def _service(self):
         svc = srv.BridgeCompanionService.__new__(srv.BridgeCompanionService)
-        svc.state = types.SimpleNamespace(action=None)
+        svc.session = FakeCompanionSessionState()
+        malformed = []
+        svc._malformed_frame = lambda reason: malformed.append(reason)
         calls = []
-        svc._relay = types.SimpleNamespace(on_touch=lambda *a: calls.append(a))
+        svc._relay = types.SimpleNamespace(on_touch=lambda *args: calls.append(args))
+        return svc, calls, malformed
+
+    def test_touch_without_optional_timestamp_is_not_malformed(self):
+        svc, calls, malformed = self._service()
+
+        svc.handle__hidt({"_c": {"_tPh": 1, "_cx": 100, "_cy": 200}})
+
+        self.assertEqual(calls, [("press", 100, 200)])
+        self.assertEqual(malformed, [])
+        self.assertEqual(svc.session.touch_event.ns, 0)
+
+    def test_release_with_missing_coords_still_reaches_relay(self):
+        svc, calls, malformed = self._service()
 
         svc.handle__hidt({"_c": {"_tPh": 4}})  # release phase, no coordinates present
 
         self.assertEqual(calls, [("release", 0, 0)])
+        self.assertEqual(malformed, [])
 
 
 class TestSetVolumeAlwaysSteps(unittest.TestCase):

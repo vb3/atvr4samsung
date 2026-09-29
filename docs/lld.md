@@ -419,8 +419,11 @@ Mechanics:
   shared websocket.
 
 
-touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). The translator resolves a
-press→release into a **tap** (total travel ≤ `tap_max_travel`=60 → SELECT) or a **swipe** (travel ≥
+touch points (`_cx/_cy` in 0–1000, phase `_tPh` 1=press/3=move/4=release). Observed on **iOS 27.0.1**:
+the `_ns` timestamp may be absent, and release frames may omit coordinates. Missing optional values
+are recorded as zero so they do not count toward the malformed-frame disconnect threshold. The
+translator resolves a press→release into a **tap** (total travel ≤ `tap_max_travel`=60 → SELECT) or a
+**swipe** (travel ≥
 `swipe_threshold`=120 → dominant axis via `dominant_ratio`=1.3 → UP/DOWN/LEFT/RIGHT). Directions map
 to keys via `GESTURE_TO_SAMSUNG`. Thresholds live in `GestureConfig` (tunable).
 

@@ -723,10 +723,13 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
         self.send_response(message, {})
 
     def handle__hidt(self, message):
-        press_mode: int = message["_c"]["_tPh"]
-        ns = message["_c"]["_ns"]
-        cx = message["_c"]["_cx"]
-        cy = message["_c"]["_cy"]
+        content = message["_c"]
+        press_mode: int = content["_tPh"]
+        # iOS 27.0.1 can omit the timestamp, and release frames can omit coordinates. These fields are
+        # diagnostic state only; the phase is the sole required touch value.
+        ns = content.get("_ns", 0)
+        cx = content.get("_cx", 0)
+        cy = content.get("_cy", 0)
         if press_mode == TouchAction.Press:
             _LOGGER.debug("Touch event press to (%s, %s) at time %s", cx, cy, ns)
         elif TouchAction.Hold:
