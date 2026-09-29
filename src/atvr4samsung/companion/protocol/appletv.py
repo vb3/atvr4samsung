@@ -524,6 +524,17 @@ class FakeCompanionService(CompanionServerAuth, asyncio.Protocol):
                 if not self.chacha:
                     return self._malformed_frame("pre-auth non-auth frame")
                 _LOGGER.debug("Received %s (%s)", frame_type.name, opack_metadata(unpacked))
+                if (
+                    isinstance(unpacked, dict)
+                    and "_i" not in unpacked
+                    and isinstance(unpacked.get("_t"), int)
+                    and unpacked["_t"] == 3
+                    and isinstance(unpacked.get("_x"), int)
+                    and not isinstance(unpacked["_x"], bool)
+                ):
+                    # watchOS startup responses can correlate by transaction ID alone; they are
+                    # not commands and need no reply. OPACK preserves some IDs as int subclasses.
+                    return self.transport is None or not self.transport.is_closing()
                 handler_method_name = f"handle_{unpacked['_i'].lower()}"
                 if hasattr(self, handler_method_name):
                     getattr(self, handler_method_name)(unpacked)

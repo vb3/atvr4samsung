@@ -187,7 +187,14 @@ without decrypting it or consuming the inbound nonce counter.
 
 **Session/command layer (`E_OPACK`):** OPACK-encoded dicts keyed by `_i` (identifier/method), `_c`
 (content), `_t` (type: 1=event, 2=request, 3=response), `_x` (transaction id). The server dispatches
-by `_i.lower()` to `handle_<name>` methods.
+by `_i.lower()` to `handle_<name>` methods. watchOS startup can also send a response without `_i`,
+for example `{"_t": 3, "_x": 1234, "_rT": 0, "_c": {}}`. After authorization, AEAD decryption,
+payload-size validation, OPACK decoding, and the pre-authentication guard, the server ignores a
+dictionary with no `_i` only when `_t` is integer `3` and `_x` is an integer transaction ID
+(including OPACK's sized integers, but not booleans). It sends no reply, dispatches no command, and
+leaves the malformed-frame budget unchanged. Unlike the cleartext NoOp exception, this is a normal
+encrypted frame and consumes its normal inbound nonce. Missing/invalid type or transaction fields,
+and present non-string identifiers, retain the existing malformed-message handling.
 
 ### TCP guardrails and protocol privacy
 
